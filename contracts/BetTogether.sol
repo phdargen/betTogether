@@ -8,6 +8,7 @@ import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 import "src/interfaces/ITruthMarket.sol";
+import "src/interfaces/ITruthMarketManager.sol";
 import "src/MarketEnums.sol";
 import {OracleLibrary} from "@uniswap/v3-periphery/contracts/libraries/OracleLibrary.sol";
 import {FullMath}      from "@uniswap/v3-core/contracts/libraries/FullMath.sol";
@@ -46,10 +47,15 @@ contract BetTogether is ReentrancyGuard, Ownable {
     uint16 public POOL_CONSISTENCY_TOLERANCE_BPS = 50;
     // Time window for TWAP calculation (30 minutes)
     uint32 public constant TWAP_SECONDS = 1_800;
+    // One yes/no token in its smallest unit (1 with 18 zeroes)
+    uint256 public constant ONE_TOKEN = 1e18;
 
     // Storage
     mapping(uint256 => Bet) public bets;
     uint256 public nextBetId;
+    
+    // Address of the TruthMarketManager contract
+    address public truthMarketManagerAddress;
     
     // Events
     event BetCreated(
@@ -78,12 +84,15 @@ contract BetTogether is ReentrancyGuard, Ownable {
         uint256 refundAmount
     );
     event PoolConsistencyToleranceUpdated(uint16 oldValue, uint16 newValue);
+    event TruthMarketManagerUpdated(address oldAddress, address newAddress);
     
     /**
      * @notice Contract constructor
+     * @param _truthMarketManagerAddress Address of the TruthMarketManager contract
      */
-    constructor() Ownable(msg.sender) {
-        // Initialize contract
+    constructor(address _truthMarketManagerAddress) Ownable(msg.sender) {
+        require(_truthMarketManagerAddress != address(0), "TruthMarketManager cannot be the zero address");
+        truthMarketManagerAddress = _truthMarketManagerAddress;
     }
 
     /**
@@ -111,13 +120,11 @@ contract BetTogether is ReentrancyGuard, Ownable {
         
         ITruthMarket market = ITruthMarket(marketAddress);
         
-        // Check if marketAddress is a valid TruthMarket contract
-        try market.paymentToken() returns (address tokenAddress) {
-            require(tokenAddress != address(0), "Payment token cannot be zero address");
-        } catch {
-            revert("Invalid TruthMarket contract address");
-        }
+        // Check if marketAddress is a valid TruthMarket contract using TruthMarketManager
+        ITruthMarketManager manager = ITruthMarketManager(truthMarketManagerAddress);
+        require(manager.isActiveMarket(marketAddress), "Not an active TruthMarket");
         
+        // Check if market is not finalized
         require(uint8(market.getCurrentStatus()) != uint8(MarketStatus.Finalized), "Market already finalized");
         
         IERC20 paymentToken = IERC20(market.paymentToken());
@@ -167,12 +174,20 @@ contract BetTogether is ReentrancyGuard, Ownable {
     /**
      * @notice Accept an existing mint request by taking the opposite position.
      * @param betId ID of the bet to accept.
+     * @param maxDeposit Maximum amount the acceptor is willing to pay (slippage protection).
+     * @param deadline Unix timestamp after which the transaction will revert.
      */
-    function acceptBet(uint256 betId) external nonReentrant {
+    function acceptBet(uint256 betId, uint256 maxDeposit, uint256 deadline) external nonReentrant {
+        require(block.timestamp <= deadline, "Transaction expired");
+        
         Bet storage bet = bets[betId];
         require(bet.marketAddress != address(0), "Bet does not exist");
         require(!bet.isExecuted, "Bet already executed or canceled");
         require(bet.acceptor == address(0), "Bet already accepted");
+        
+        // Check if marketAddress is still a valid TruthMarket contract
+        ITruthMarketManager manager = ITruthMarketManager(truthMarketManagerAddress);
+        require(manager.isActiveMarket(bet.marketAddress), "Not an active TruthMarket");
         
         ITruthMarket market = ITruthMarket(bet.marketAddress);
         IERC20 paymentToken = IERC20(market.paymentToken());
@@ -193,6 +208,7 @@ contract BetTogether is ReentrancyGuard, Ownable {
         }
         require(currentPriceForInitiatorSide > 0, "Current price for initiator side is zero");
         require(acceptorDepositAmount > 0, "Calculated acceptor amount is zero");
+        require(acceptorDepositAmount <= maxDeposit, "Acceptor deposit exceeds maximum");
 
         // Check initiator's price tolerance
         uint256 priceDifference = currentPriceForInitiatorSide > bet.initialPriceForInitiator 
@@ -223,111 +239,97 @@ contract BetTogether is ReentrancyGuard, Ownable {
         (address yesPool, address noPool) = market.getPoolAddresses();
         require(yesPool != address(0) && noPool != address(0), "Pools not set");
 
-        // 1. Pull 30-minute TWAP ticks from each pool
-        (int24 yesTick,) = OracleLibrary.consult(yesPool, TWAP_SECONDS);
-        (int24 noTick,) = OracleLibrary.consult(noPool, TWAP_SECONDS);
+        // Pull TWAP ticks from each pool
+        (int24 yesTick, uint128 yesLiquidity) = OracleLibrary.consult(yesPool, TWAP_SECONDS);
+        (int24 noTick, uint128 noLiquidity) = OracleLibrary.consult(noPool, TWAP_SECONDS);
 
-        // 2. Convert tick → price with proper decimal handling
+        // Get tokens
         address payTok = market.paymentToken();
         address yesTok = market.yesToken();
         address noTok = market.noToken();
         
-        // Cache decimals to avoid multiple external calls
+        // Get decimals for payment token
         uint256 payDec = IERC20Metadata(payTok).decimals();
-        uint256 tokenDec = IERC20Metadata(yesTok).decimals();
-        // YES and NO tokens always have the same decimals
-        uint256 oneToken = 10**tokenDec;
 
-        // YES price
+        // YES price calculation
         if (IUniswapV3Pool(yesPool).token0() == payTok) {
             // pool is payment/YES ⇒ getQuote gives YES per 1 payment; invert
             uint256 quote = OracleLibrary.getQuoteAtTick(yesTick, uint128(10**payDec), payTok, yesTok);
-            // Scale before inversion
-            quote = FullMath.mulDiv(quote, PRICE_PRECISION, 10**payDec);
+            // Scale before inversion - quote is in units of YES tokens per 1 payment token
+            quote = FullMath.mulDiv(quote, PRICE_PRECISION, ONE_TOKEN);
             avgYesPrice = FullMath.mulDiv(PRICE_PRECISION, PRICE_PRECISION, quote);  // 1 / quote
         } else {
             // pool is YES/payment ⇒ getQuote gives payment per 1 YES (already what we want)
-            uint256 quote = OracleLibrary.getQuoteAtTick(yesTick, uint128(oneToken), yesTok, payTok);
+            uint256 quote = OracleLibrary.getQuoteAtTick(yesTick, uint128(ONE_TOKEN), yesTok, payTok);
             avgYesPrice = FullMath.mulDiv(quote, PRICE_PRECISION, 10**payDec);
         }
 
-        // NO price - use the same pattern as YES price for consistency
+        // NO price calculation - use the exact same pattern as YES price 
         if (IUniswapV3Pool(noPool).token0() == payTok) {
             // pool is payment/NO ⇒ getQuote gives NO per 1 payment; invert
             uint256 quote = OracleLibrary.getQuoteAtTick(noTick, uint128(10**payDec), payTok, noTok);
-            // Scale before inversion
-            quote = FullMath.mulDiv(quote, PRICE_PRECISION, 10**payDec);
+            // Scale before inversion - quote is in units of NO tokens per 1 payment token
+            quote = FullMath.mulDiv(quote, PRICE_PRECISION, ONE_TOKEN);
             avgNoPrice = FullMath.mulDiv(PRICE_PRECISION, PRICE_PRECISION, quote);  // 1 / quote
         } else {
             // pool is NO/payment ⇒ getQuote gives payment per 1 NO (already what we want)
-            uint256 quote = OracleLibrary.getQuoteAtTick(noTick, uint128(oneToken), noTok, payTok);
+            uint256 quote = OracleLibrary.getQuoteAtTick(noTick, uint128(ONE_TOKEN), noTok, payTok);
             avgNoPrice = FullMath.mulDiv(quote, PRICE_PRECISION, 10**payDec);
         }
         
-        // 3. Consistency guard + optional normalization
+        // Consistency guard
         require(avgYesPrice > 0 && avgYesPrice < PRICE_PRECISION, "YES price out of range");
         require(avgNoPrice > 0 && avgNoPrice < PRICE_PRECISION, "NO price out of range");
 
-        // Normalize prices if they don't sum close to PRICE_PRECISION
-        (avgYesPrice, avgNoPrice) = _normalizePrices(avgYesPrice, avgNoPrice);
+        // Check if sum is reasonably close to PRICE_PRECISION before normalization
+        uint256 sum = avgYesPrice + avgNoPrice;
+        require( (sum > PRICE_PRECISION 
+            ? sum - PRICE_PRECISION 
+            : PRICE_PRECISION - sum) <= (PRICE_PRECISION * POOL_CONSISTENCY_TOLERANCE_BPS) / 10000, "YES/NO price sum inconsistent with PRICE_PRECISION");
+
+        // Apply liquidity-weighted normalization via separate function to avoid stack too deep errors
+        (avgYesPrice, avgNoPrice) = _normalizePricesWithLiquidity(
+            avgYesPrice, 
+            avgNoPrice, 
+            yesLiquidity, 
+            noLiquidity 
+        );
     }
 
     /**
-     * @notice Normalize YES and NO prices to ensure they sum to PRICE_PRECISION
-     * @param yesPrice The YES price to normalize
-     * @param noPrice The NO price to normalize
-     * @return normalizedYesPrice The normalized YES price
-     * @return normalizedNoPrice The normalized NO price
+     * @notice Internal function to normalize prices based on pool liquidity weights
+     * @param yesPrice The initial YES price
+     * @param noPrice The initial NO price
+     * @param yesLiquidity The YES pool liquidity
+     * @param noLiquidity The NO pool liquidity
+     * @return normYes The normalized YES price
+     * @return normNo The normalized NO price
      */
-    function _normalizePrices(uint256 yesPrice, uint256 noPrice) internal pure returns (uint256 normalizedYesPrice, uint256 normalizedNoPrice) {
-        // First check if either price is unreasonably small (such as 358995 vs 639943000000000000)
-        // This indicates a calculation error or bad pool data
-        uint256 minReasonablePrice = PRICE_PRECISION / 100; // 1% minimum
+    function _normalizePricesWithLiquidity(
+        uint256 yesPrice,               // 1e18‑scaled
+        uint256 noPrice,                // 1e18‑scaled
+        uint128 yesLiquidity,
+        uint128 noLiquidity
+    ) internal pure returns (uint256 normYes, uint256 normNo)
+    {
+        // 1 – NO  → implied YES
+        uint256 impliedYes = PRICE_PRECISION - noPrice;
 
-        // If either price is too small but the other isn't, we need more aggressive correction
-        if ((yesPrice < minReasonablePrice && noPrice >= minReasonablePrice) || 
-            (noPrice < minReasonablePrice && yesPrice >= minReasonablePrice)) {
-            
-            // If one price is reasonable but the other isn't, derive the small one from the other
-            if (yesPrice < minReasonablePrice && noPrice >= minReasonablePrice) {
-                // YES price is too small, but NO price looks ok - cap NO and derive YES
-                if (noPrice > PRICE_PRECISION * 90 / 100) {
-                    // NO price is very high, cap it at 90%
-                    normalizedNoPrice = PRICE_PRECISION * 90 / 100;
-                } else {
-                    normalizedNoPrice = noPrice;
-                }
-                normalizedYesPrice = PRICE_PRECISION - normalizedNoPrice;
-                return (normalizedYesPrice, normalizedNoPrice);
-            } else {
-                // NO price is too small, but YES price looks ok - cap YES and derive NO
-                if (yesPrice > PRICE_PRECISION * 90 / 100) {
-                    // YES price is very high, cap it at 90%
-                    normalizedYesPrice = PRICE_PRECISION * 90 / 100;
-                } else {
-                    normalizedYesPrice = yesPrice;
-                }
-                normalizedNoPrice = PRICE_PRECISION - normalizedYesPrice;
-                return (normalizedYesPrice, normalizedNoPrice);
-            }
-        }
-
-        // Regular normalization for more normal cases
-        uint256 sum = yesPrice + noPrice;
+        // Using a direct weighted average formula to avoid overflow
+        // w1 = yesLiquidity / (yesLiquidity + noLiquidity)
+        // w2 = noLiquidity / (yesLiquidity + noLiquidity)
+        // normYes = w1 * yesPrice + w2 * impliedYes
         
-        // If sum is too low, it could indicate both prices are problematic
-        if (sum < PRICE_PRECISION / 10) { // Less than 10% of expected sum
-            // Use a default 50/50 split as fallback
-            normalizedYesPrice = PRICE_PRECISION / 2;
-            normalizedNoPrice = PRICE_PRECISION / 2;
-            return (normalizedYesPrice, normalizedNoPrice);
-        }
+        uint256 totalLiquidity = uint256(yesLiquidity) + uint256(noLiquidity);
+        require(totalLiquidity > 0, "Total liquidity cannot be zero");
         
-        // Otherwise, normalize proportionally
-        normalizedYesPrice = FullMath.mulDiv(yesPrice, PRICE_PRECISION, sum);
-        normalizedNoPrice = PRICE_PRECISION - normalizedYesPrice;
+        // Calculate weights and normalized price in a single step to avoid overflow
+        normYes = (FullMath.mulDiv(yesPrice, uint256(yesLiquidity), totalLiquidity) + 
+                  FullMath.mulDiv(impliedYes, uint256(noLiquidity), totalLiquidity));
+                  
+        normNo = PRICE_PRECISION - normYes;
     }
-    
+
     /**
      * @notice Get the current average fair prices of YES and NO tokens from Uniswap V3 pools.
      * @param marketAddress Address of the TruthMarket contract.
@@ -425,7 +427,6 @@ contract BetTogether is ReentrancyGuard, Ownable {
         
         // Cache decimals to avoid multiple external calls
         uint256 paymentTokenDecimals = IERC20Metadata(paymentTokenAddr).decimals();
-        uint256 tokenDec = IERC20Metadata(yesTokenAddr).decimals();
         
         // Get token interfaces
         IERC20 paymentToken = IERC20(paymentTokenAddr);
@@ -448,7 +449,7 @@ contract BetTogether is ReentrancyGuard, Ownable {
         
         uint256 totalTokensMintedPerType = FullMath.mulDiv(
             totalPaymentAmount,
-            10**tokenDec,
+            ONE_TOKEN,
             10**paymentTokenDecimals
         );
         require(totalTokensMintedPerType > 0, "Minted zero tokens");
@@ -514,5 +515,16 @@ contract BetTogether is ReentrancyGuard, Ownable {
         uint16 oldValue = POOL_CONSISTENCY_TOLERANCE_BPS;
         POOL_CONSISTENCY_TOLERANCE_BPS = _bps;
         emit PoolConsistencyToleranceUpdated(oldValue, _bps);
+    }
+
+    /**
+     * @notice Updates the TruthMarketManager address
+     * @param _truthMarketManagerAddress The new TruthMarketManager address
+     */
+    function setTruthMarketManagerAddress(address _truthMarketManagerAddress) external onlyOwner {
+        require(_truthMarketManagerAddress != address(0), "TruthMarketManager cannot be the zero address");
+        address oldAddress = truthMarketManagerAddress;
+        truthMarketManagerAddress = _truthMarketManagerAddress;
+        emit TruthMarketManagerUpdated(oldAddress, _truthMarketManagerAddress);
     }
 } 

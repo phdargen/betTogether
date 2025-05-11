@@ -1,8 +1,9 @@
 import { expect } from "chai";
 import hre from "hardhat"; 
-import { loadFixture } from "@nomicfoundation/hardhat-network-helpers"; 
+import { loadFixture, time } from "@nomicfoundation/hardhat-network-helpers"; 
 import { WalletClient, PublicClient, getContract } from "viem"; 
 import { parseUnits, formatUnits, zeroAddress, Address, parseAbiItem } from "viem";
+import BetTogetherArtifact from "../artifacts/contracts/BetTogether.sol/BetTogether.json";
 
 const truthMarketMinimalAbi = [
     parseAbiItem("function marketQuestion() view returns (string)"),
@@ -22,6 +23,15 @@ const erc20Abi = [
     parseAbiItem("function allowance(address, address) view returns (uint256)")
 ] as const;
 
+// Add interfaces for type-safe contract interactions
+interface IERC20 {
+    approve(spender: Address, amount: bigint, options: any): Promise<`0x${string}`>;
+}
+
+interface ITruthMarket {
+    paymentToken(): Promise<Address>;
+}
+
 describe("BetTogether with Viem", function () {
     let betTogether: any; 
     let owner: WalletClient;
@@ -29,16 +39,35 @@ describe("BetTogether with Viem", function () {
     let addr2: WalletClient;
     let publicClient: PublicClient; 
 
-    const truthMarketAddress = "0xa93B6Fe76764297fd6E9C649c1401Bd53C469515" as Address;
+    const truthMarketAddress = "0xef600f40655ad521404379fefec9bdbf9c481382" as Address;
+    const truthMarketManagerAddress = "0x61A98Bef11867c69489B91f340fE545eEfc695d7" as Address;
     
     // Corresponds to PRICE_PRECISION = 1e18 in the contract, now as bigint
     const PRICE_PRECISION = parseUnits("1", 18); 
 
     async function deployBetTogetherFixture() {
         const [ownerAccount, addr1Account, addr2Account] = await hre.viem.getWalletClients();
-        const deployedBetTogether = await hre.viem.deployContract("BetTogether", []);
-        const pubClient = await hre.viem.getPublicClient();
-        return { deployedBetTogether, ownerAccount, addr1Account, addr2Account, pubClient };
+        const publicClient = await hre.viem.getPublicClient();
+        
+        // Deploy the contract using viem's createWalletClient
+        const hash = await ownerAccount.deployContract({
+            abi: BetTogetherArtifact.abi,
+            bytecode: BetTogetherArtifact.bytecode as `0x${string}`,
+            args: [truthMarketManagerAddress]
+        });
+        
+        const receipt = await publicClient.waitForTransactionReceipt({ hash });
+        
+        const deployedBetTogether = getContract({
+            abi: BetTogetherArtifact.abi,
+            address: receipt.contractAddress as Address,
+            client: {
+                public: publicClient,
+                wallet: ownerAccount
+            }
+        });
+        
+        return { deployedBetTogether, ownerAccount, addr1Account, addr2Account, pubClient: publicClient };
     }
 
     beforeEach(async function () {
@@ -102,6 +131,39 @@ describe("BetTogether with Viem", function () {
              // or more specific if the called contract has specific checks.
              // Using a general Error check or a regex for part of an expected message is safer.
              await expect(betTogether.read.getPoolPrices([zeroAddress])).to.be.rejectedWith(Error);
+        });
+    });
+
+    describe("Market Validation", function() {
+        it("should reject creating a bet with an invalid market address", async function() {
+            // Use a random address that isn't registered as an active market
+            const randomAddress = "0x1234567890123456789012345678901234567890" as Address;
+            
+            // Parameters for the bet
+            const takesYesPosition = true;
+            const amount = parseUnits("1", 18); // 1 token with 18 decimals
+            const priceToleranceBps = 500; // 5% tolerance
+            
+            // Attempt to create a bet with the random address should fail
+            // because the TruthMarketManager should not recognize it as an active market
+            await expect(
+                betTogether.write.createBet(
+                    [randomAddress, takesYesPosition, amount, priceToleranceBps], 
+                    { account: owner.account! }
+                )
+            ).to.be.rejectedWith("Not an active TruthMarket");
+        });
+
+        it("should reject accepting a bet if maxDeposit is too low", async function() {
+            // This test would require a fully mocked environment to test properly
+            // It would create a bet, calculate the acceptor amount, and then try to accept with a too-low maxDeposit
+            console.log("Test for maxDeposit protection would be implemented here with proper mocking");
+        });
+
+        it("should reject accepting a bet if deadline has passed", async function() {
+            // This test would require a fully mocked environment to test properly
+            // It would create a bet and then try to accept it with a past deadline
+            console.log("Test for deadline protection would be implemented here with proper mocking");
         });
     });
 
@@ -471,7 +533,7 @@ describe("BetTogether with Viem", function () {
             const approvalAmount = parseUnits("5", paymentTokenDecimals);
             let hash = await paymentToken.write.approve(
                 [betTogether.address, approvalAmount],
-                { account: owner.account! }
+                { account: owner.account!, chain: null }
             );
             await publicClient.waitForTransactionReceipt({ hash });
             
@@ -541,7 +603,7 @@ describe("BetTogether with Viem", function () {
                 });
                 
                 // Verify the bet was created with the expected parameters
-                expect(bet[0]).to.equal(betParams.marketAddress);
+                expect(bet[0].toLowerCase()).to.equal(betParams.marketAddress.toLowerCase());
                 expect(bet[1].toLowerCase()).to.equal(owner.account!.address.toLowerCase());
                 expect(bet[2]).to.equal(betParams.takesYesPosition);
                 expect(bet[3]).to.equal(betParams.amount);
@@ -613,7 +675,7 @@ describe("BetTogether with Viem", function () {
             const ownerApprovalAmount = parseUnits("0.2", paymentTokenDecimals);
             let hash = await paymentToken.write.approve(
                 [betTogether.address, ownerApprovalAmount],
-                { account: owner.account! }
+                { account: owner.account!, chain: null }
             );
             await publicClient.waitForTransactionReceipt({ hash });
             
@@ -623,7 +685,8 @@ describe("BetTogether with Viem", function () {
                 [betTogether.address, addr1ApprovalAmount],
                 { 
                     account: addr1.account!,
-                    gas: 2000000n
+                    gas: 2000000n,
+                    chain: null
                 }
             );
             await publicClient.waitForTransactionReceipt({ hash });
@@ -634,7 +697,8 @@ describe("BetTogether with Viem", function () {
                 [betTogether.address, addr2ApprovalAmount],
                 { 
                     account: addr2.account!,
-                    gas: 2000000n
+                    gas: 2000000n,
+                    chain: null
                 }
             );
             await publicClient.waitForTransactionReceipt({ hash });
@@ -694,8 +758,10 @@ describe("BetTogether with Viem", function () {
             
             // 5. addr1 accepts the bet
             console.log("\naddr1 accepting the bet...");
+            const maxAcceptorDeposit = parseUnits("0.5", paymentTokenDecimals); // High enough limit for expectedCounterpartyAmount
+            const acceptDeadline = BigInt(Math.floor(Date.now() / 1000) + 3600); // 1 hour from now
             hash = await betTogether.write.acceptBet(
-                [betId],
+                [betId, maxAcceptorDeposit, acceptDeadline],
                 { 
                     account: addr1.account!,
                     gas: 4000000n // Increase gas limit
@@ -709,7 +775,7 @@ describe("BetTogether with Viem", function () {
             console.log("\naddr2 attempting to accept already accepted bet (should fail)...");
             try {
                 await betTogether.write.acceptBet(
-                    [betId],
+                    [betId, maxAcceptorDeposit, acceptDeadline],
                     { 
                         account: addr2.account!,
                         gas: 4000000n
@@ -775,6 +841,175 @@ describe("BetTogether with Viem", function () {
             expect(betAfter[8]).to.be.true; // isExecuted should be true
             
             console.log("\nFull bet workflow test completed successfully!");
+        });
+    });
+
+    describe("Safety Features", function() {
+        // Skip this suite if we can't connect to mainnet fork
+        before(async function() {
+            try {
+                // Try to access the TruthMarket contract
+                const code = await publicClient.getCode({ address: truthMarketAddress });
+                if (code === "0x" || code === undefined) {
+                    console.log("TruthMarket contract not found on the network. Skipping Safety Features tests.");
+                    this.skip();
+                }
+            } catch (error) {
+                console.error("Error checking TruthMarket contract:", error);
+                this.skip();
+            }
+        });
+
+        it("should reject accepting a bet when maxDeposit is too low", async function() {
+            // Create a bet first
+            const takesYesPosition = true;
+            const priceToleranceBps = 1000; // 10% tolerance
+            
+            // Get the market and payment token contracts
+            const truthMarketContract_internal = getContract({
+                abi: truthMarketMinimalAbi,
+                address: truthMarketAddress,
+                client: { public: publicClient }
+            });
+            
+            const paymentTokenAddress_internal = await truthMarketContract_internal.read.paymentToken();
+            const paymentToken_internal = getContract({
+                abi: erc20Abi,
+                address: paymentTokenAddress_internal,
+                client: { 
+                    public: publicClient,
+                    wallet: owner
+                }
+            });
+            const paymentTokenDecimals_internal = await paymentToken_internal.read.decimals();
+            const initiatorAmount = parseUnits("0.1", paymentTokenDecimals_internal); // CORRECT DECIMALS
+            
+            // Ensure owner has USDC approval
+            await paymentToken_internal.write.approve(
+                [betTogether.address, parseUnits("1", paymentTokenDecimals_internal)], // CORRECT DECIMALS
+                { account: owner.account!, chain: null }
+            );
+            
+            // Create a bet
+            const createHash = await betTogether.write.createBet(
+                [truthMarketAddress, takesYesPosition, initiatorAmount, priceToleranceBps],
+                { account: owner.account!, chain: null } // Added chain: null here as well for consistency
+            );
+            await publicClient.waitForTransactionReceipt({ hash: createHash });
+            
+            // Get the betId (should be incremented from previous tests)
+            const betId = await betTogether.read.nextBetId() - 1n;
+            
+            // Get the fair counterparty amount
+            const fairAmount = await betTogether.read.getFairCounterpartyAmount([betId]);
+            console.log(`Fair counterparty amount: ${fairAmount}`);
+            
+            // Set maxDeposit too low (50% of required amount)
+            const tooLowDeposit = fairAmount * 50n / 100n;
+            const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600); // 1 hour from now
+            
+            // Ensure addr1 has USDC approval
+            await paymentToken_internal.write.approve(
+                [betTogether.address, fairAmount],
+                { account: addr1.account!, chain: null }
+            );
+            
+            // Attempt to accept with too low maxDeposit should fail
+            await expect(
+                betTogether.write.acceptBet(
+                    [betId, tooLowDeposit, deadline],
+                    { account: addr1.account! }
+                )
+            ).to.be.rejectedWith("Acceptor deposit exceeds maximum");
+        });
+        
+        it("should reject accepting a bet when deadline has passed", async function() {
+            // Get the market and payment token contracts first to get decimals
+            const truthMarketContract_deadlineTest = getContract({
+                abi: truthMarketMinimalAbi,
+                address: truthMarketAddress,
+                client: { public: publicClient }
+            });
+            const paymentTokenAddress_deadlineTest = await truthMarketContract_deadlineTest.read.paymentToken();
+            const paymentToken_deadlineTest = getContract({
+                abi: erc20Abi,
+                address: paymentTokenAddress_deadlineTest,
+                client: { 
+                    public: publicClient,
+                    wallet: owner // owner has funds to transfer
+                }
+            });
+            const paymentTokenDecimals_deadlineTest = await paymentToken_deadlineTest.read.decimals();
+
+            // Ensure addr1 has enough funds for this specific test
+            const transferToAddr1Amount = parseUnits("0.5", paymentTokenDecimals_deadlineTest);
+            if (addr1.account) { // Check if addr1 account exists
+                const addr1BalanceBefore = await paymentToken_deadlineTest.read.balanceOf([addr1.account.address]);
+                if (addr1BalanceBefore < transferToAddr1Amount) {
+                    console.log(`Transferring ${formatUnits(transferToAddr1Amount, paymentTokenDecimals_deadlineTest)} tokens to addr1 for deadline test`);
+                    const transferHash = await paymentToken_deadlineTest.write.transfer(
+                        [addr1.account.address, transferToAddr1Amount],
+                        { account: owner.account!, chain: null }
+                    );
+                    await publicClient.waitForTransactionReceipt({ hash: transferHash });
+                }
+            }
+
+            // Create a bet first
+            const takesYesPosition = true;
+            const initiatorAmount = parseUnits("0.1", paymentTokenDecimals_deadlineTest);
+            const priceToleranceBps = 1000; // 10% tolerance
+            
+            // Ensure owner has USDC approval for creating the bet
+            await paymentToken_deadlineTest.write.approve(
+                [betTogether.address, parseUnits("1", paymentTokenDecimals_deadlineTest)],
+                { account: owner.account!, chain: null }
+            );
+            
+            // Create a bet
+            const createHash = await betTogether.write.createBet(
+                [truthMarketAddress, takesYesPosition, initiatorAmount, priceToleranceBps],
+                { account: owner.account!, chain: null }
+            );
+            await publicClient.waitForTransactionReceipt({ hash: createHash });
+            
+            // Get the betId (should be incremented from previous tests)
+            const betId = await betTogether.read.nextBetId() - 1n;
+            
+            // Get the fair counterparty amount
+            const fairAmount = await betTogether.read.getFairCounterpartyAmount([betId]);
+            console.log(`Fair counterparty amount for deadline test: ${formatUnits(fairAmount, paymentTokenDecimals_deadlineTest)}`);
+            
+            // Set a deadline relative to the current block's timestamp
+            const currentBlockTimestamp = await time.latest();
+            const deadlineToUseInTx = BigInt(currentBlockTimestamp + 3600); // 1 hour in the future from current block time
+
+            // Advance time to be AFTER deadlineToUseInTx
+            await time.increaseTo(currentBlockTimestamp + 3600 + 60); // Go 1 hour and 60 seconds past the original block time
+            
+            // Addr1 approves for accepting the bet
+            if (addr1.account) { 
+                const paymentToken_addr1Scope = getContract({
+                    abi: erc20Abi,
+                    address: paymentTokenAddress_deadlineTest, 
+                    client: { 
+                        public: publicClient,
+                        wallet: addr1 
+                    }
+                });
+                await paymentToken_addr1Scope.write.approve(
+                    [betTogether.address, fairAmount * 2n], 
+                    { account: addr1.account!, chain: null } 
+                );
+            }
+            
+            // Attempt to accept with the deadline that is now in the past
+            await expect(
+                betTogether.write.acceptBet(
+                    [betId, fairAmount * 2n, deadlineToUseInTx],
+                    { account: addr1.account!, chain: null }
+                )
+            ).to.be.rejectedWith("Transaction expired");
         });
     });
 }); 
