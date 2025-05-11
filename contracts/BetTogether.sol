@@ -37,6 +37,7 @@ contract BetTogether is ReentrancyGuard, Ownable {
 
         bool isExecuted; // True if tokens have been minted and distributed, or if canceled
         uint256 createdAt;
+        uint256 rewardAmount; // Optional reward for the acceptor
     }
     
     // Constants
@@ -49,6 +50,12 @@ contract BetTogether is ReentrancyGuard, Ownable {
     uint32 public constant TWAP_SECONDS = 1_800;
     // One yes/no token in its smallest unit (1 with 18 zeroes)
     uint256 public constant ONE_TOKEN = 1e18;
+    // Platform fee in basis points (e.g., 25 = 0.25%)
+    uint16 public platformFeeBps = 0;
+    
+    // Minimum and maximum bet amounts (in payment token units)
+    uint256 public minBetAmount = 0;
+    uint256 public maxBetAmount = 10000000; // 10 USDC
 
     // Storage
     mapping(uint256 => Bet) public bets;
@@ -56,6 +63,8 @@ contract BetTogether is ReentrancyGuard, Ownable {
     
     // Address of the TruthMarketManager contract
     address public truthMarketManagerAddress;
+    // TruthMarketManager interface
+    ITruthMarketManager public manager;
     
     // Events
     event BetCreated(
@@ -66,7 +75,8 @@ contract BetTogether is ReentrancyGuard, Ownable {
         uint256 initiatorAmount,
         uint16 priceToleranceBps,
         uint256 initialPriceForInitiator, // Price for initiator's side at creation
-        uint256 suggestedCounterpartyAmount
+        uint256 suggestedCounterpartyAmount,
+        uint256 rewardAmount
     );
     event BetAccepted(
         uint256 indexed betId, 
@@ -83,8 +93,16 @@ contract BetTogether is ReentrancyGuard, Ownable {
         address indexed initiator, 
         uint256 refundAmount
     );
+    event RewardPaid(
+        uint256 indexed betId,
+        address indexed acceptor,
+        uint256 rewardAmount
+    );
     event PoolConsistencyToleranceUpdated(uint16 oldValue, uint16 newValue);
-    event TruthMarketManagerUpdated(address oldAddress, address newAddress);
+    event PlatformFeeUpdated(uint16 oldValue, uint16 newValue);
+    event PlatformFeesCollected(uint256 feeAmount);
+    event MinBetAmountUpdated(uint256 oldValue, uint256 newValue);
+    event MaxBetAmountUpdated(uint256 oldValue, uint256 newValue);
     
     /**
      * @notice Contract constructor
@@ -93,6 +111,7 @@ contract BetTogether is ReentrancyGuard, Ownable {
     constructor(address _truthMarketManagerAddress) Ownable(msg.sender) {
         require(_truthMarketManagerAddress != address(0), "TruthMarketManager cannot be the zero address");
         truthMarketManagerAddress = _truthMarketManagerAddress;
+        manager = ITruthMarketManager(_truthMarketManagerAddress);
     }
 
     /**
@@ -100,7 +119,8 @@ contract BetTogether is ReentrancyGuard, Ownable {
      * @param marketAddress Address of the TruthMarket contract.
      * @param takesYesPosition True if the initiator wants the YES position, false for NO.
      * @param amount Amount of payment tokens the initiator is depositing.
-     * @param priceToleranceBps Initiator's acceptable price deviation in basis points (e.g., 300 for 3%). Max 10000 (100%).
+     * @param priceToleranceBps Initiator's acceptable price deviation in basis points (e.g., 300 for 3%). Max 1000 (10%).
+     * @param rewardAmount Optional reward to offer to someone who accepts the bet.
      * @return betId Unique identifier for the created bet.
      * @return suggestedCounterpartyAmount Current suggested amount for counterparty based on current fair prices.
      */
@@ -108,7 +128,8 @@ contract BetTogether is ReentrancyGuard, Ownable {
         address marketAddress, 
         bool takesYesPosition, 
         uint256 amount,
-        uint16 priceToleranceBps
+        uint16 priceToleranceBps,
+        uint256 rewardAmount
     ) 
         external 
         nonReentrant 
@@ -116,12 +137,14 @@ contract BetTogether is ReentrancyGuard, Ownable {
     {
         require(marketAddress != address(0), "Invalid market address");
         require(amount > 0, "Amount must be greater than 0");
-        require(priceToleranceBps > 0 && priceToleranceBps <= 10000, "Invalid price tolerance BPS"); // Max 100%
+        require(amount >= minBetAmount, "Amount below minimum bet amount");
+        require(amount <= maxBetAmount, "Amount exceeds maximum bet amount");
+        require(priceToleranceBps > 0 && priceToleranceBps <= 1000, "Invalid price tolerance BPS"); // Max 10%
+        require(rewardAmount <= (amount * 10) / 100, "Reward exceeds 10% of bet amount");
         
         ITruthMarket market = ITruthMarket(marketAddress);
         
         // Check if marketAddress is a valid TruthMarket contract using TruthMarketManager
-        ITruthMarketManager manager = ITruthMarketManager(truthMarketManagerAddress);
         require(manager.isActiveMarket(marketAddress), "Not an active TruthMarket");
         
         // Check if market is not finalized
@@ -142,7 +165,8 @@ contract BetTogether is ReentrancyGuard, Ownable {
         require(priceForInitiatorAtCreation > 0, "Initiator price cannot be zero");
         require(suggestedCounterpartyAmount > 0, "Suggested counterparty amount is zero");
 
-        paymentToken.safeTransferFrom(msg.sender, address(this), amount);
+        // Transfer the bet amount plus any reward offered
+        paymentToken.safeTransferFrom(msg.sender, address(this), amount + rewardAmount);
         
         betId = nextBetId++;
         
@@ -156,7 +180,8 @@ contract BetTogether is ReentrancyGuard, Ownable {
             priceToleranceBps: priceToleranceBps,
             initialPriceForInitiator: priceForInitiatorAtCreation,
             isExecuted: false, // Not executed or canceled yet
-            createdAt: block.timestamp
+            createdAt: block.timestamp,
+            rewardAmount: rewardAmount
         });
         
         emit BetCreated(
@@ -167,10 +192,11 @@ contract BetTogether is ReentrancyGuard, Ownable {
             amount, 
             priceToleranceBps,
             priceForInitiatorAtCreation,
-            suggestedCounterpartyAmount
+            suggestedCounterpartyAmount,
+            rewardAmount
         );
     }
-    
+
     /**
      * @notice Accept an existing mint request by taking the opposite position.
      * @param betId ID of the bet to accept.
@@ -186,7 +212,6 @@ contract BetTogether is ReentrancyGuard, Ownable {
         require(bet.acceptor == address(0), "Bet already accepted");
         
         // Check if marketAddress is still a valid TruthMarket contract
-        ITruthMarketManager manager = ITruthMarketManager(truthMarketManagerAddress);
         require(manager.isActiveMarket(bet.marketAddress), "Not an active TruthMarket");
         
         ITruthMarket market = ITruthMarket(bet.marketAddress);
@@ -401,7 +426,7 @@ contract BetTogether is ReentrancyGuard, Ownable {
         require(bet.acceptor == address(0), "Cannot cancel an accepted bet");
         require(!bet.isExecuted, "Bet already executed or previously canceled");
         
-        uint256 refundAmount = bet.initiatorAmount;
+        uint256 refundAmount = bet.initiatorAmount + bet.rewardAmount;
         
         bet.isExecuted = true; // Mark as "closed" (either executed or canceled)
         
@@ -433,22 +458,43 @@ contract BetTogether is ReentrancyGuard, Ownable {
         IERC20 yesTokenContract = IERC20(yesTokenAddr);
         IERC20 noTokenContract = IERC20(noTokenAddr);
 
+        // First, pay out any reward to the acceptor
+        if (bet.rewardAmount > 0) {
+            paymentToken.safeTransfer(bet.acceptor, bet.rewardAmount);
+            emit RewardPaid(betId, bet.acceptor, bet.rewardAmount);
+        }
+
         uint256 totalPaymentAmount = bet.initiatorAmount + bet.acceptorAmount;
         
-        // Approve TruthMarket to spend the payment tokens held by this BetTogether contract.
-        paymentToken.safeIncreaseAllowance(bet.marketAddress, totalPaymentAmount);
+        // Calculate and transfer platform fee if set
+        uint256 feeAmount = 0;
+        uint256 mintAmount = totalPaymentAmount;
         
-        // Call TruthMarket.mint(). It expects total paymentTokenAmount.
+        if (platformFeeBps > 0) {
+            feeAmount = (totalPaymentAmount * platformFeeBps) / 10000;
+            mintAmount = totalPaymentAmount - feeAmount;
+            
+            // Transfer fee to owner
+            if (feeAmount > 0) {
+                paymentToken.safeTransfer(owner(), feeAmount);
+                emit PlatformFeesCollected(feeAmount);
+            }
+        }
+        
+        // Approve TruthMarket to spend the payment tokens held by this BetTogether contract.
+        paymentToken.safeIncreaseAllowance(bet.marketAddress, mintAmount);
+        
+        // Call TruthMarket.mint() with the amount after fee.
         // It mints an equal quantity of YES and NO tokens to msg.sender (this contract).
         // The quantity of each token type minted is:
         // paymentTokenAmount * (10 ** tokenDec) / (10 ** paymentTokenDecimals)
-        market.mint(totalPaymentAmount); 
+        market.mint(mintAmount); 
         
         // Mark bet as completed immediately after minting but before external transfers
         bet.isExecuted = true;
         
         uint256 totalTokensMintedPerType = FullMath.mulDiv(
-            totalPaymentAmount,
+            mintAmount,
             ONE_TOKEN,
             10**paymentTokenDecimals
         );
@@ -478,6 +524,7 @@ contract BetTogether is ReentrancyGuard, Ownable {
      * @return initialPriceForInitiator Fair price for initiator's side at creation.
      * @return isExecuted True if the bet has been executed or canceled.
      * @return createdAt Timestamp when the bet was created.
+     * @return rewardAmount Amount of reward offered to the acceptor.
      */
     function getBet(uint256 betId) external view returns (
         address marketAddress,
@@ -489,7 +536,8 @@ contract BetTogether is ReentrancyGuard, Ownable {
         uint16 priceToleranceBps,
         uint256 initialPriceForInitiator,
         bool isExecuted,
-        uint256 createdAt
+        uint256 createdAt,
+        uint256 rewardAmount
     ) {
         Bet storage bet = bets[betId];
         return (
@@ -502,7 +550,8 @@ contract BetTogether is ReentrancyGuard, Ownable {
             bet.priceToleranceBps,
             bet.initialPriceForInitiator,
             bet.isExecuted,
-            bet.createdAt
+            bet.createdAt,
+            bet.rewardAmount
         );
     }
 
@@ -518,13 +567,35 @@ contract BetTogether is ReentrancyGuard, Ownable {
     }
 
     /**
-     * @notice Updates the TruthMarketManager address
-     * @param _truthMarketManagerAddress The new TruthMarketManager address
+     * @notice Sets the platform fee in basis points.
+     * @param _bps New fee value in basis points (1 BPS = 0.01%)
      */
-    function setTruthMarketManagerAddress(address _truthMarketManagerAddress) external onlyOwner {
-        require(_truthMarketManagerAddress != address(0), "TruthMarketManager cannot be the zero address");
-        address oldAddress = truthMarketManagerAddress;
-        truthMarketManagerAddress = _truthMarketManagerAddress;
-        emit TruthMarketManagerUpdated(oldAddress, _truthMarketManagerAddress);
+    function setPlatformFee(uint16 _bps) external onlyOwner {
+        require(_bps <= 500, "Fee cannot exceed 5%");
+        uint16 oldValue = platformFeeBps;
+        platformFeeBps = _bps;
+        emit PlatformFeeUpdated(oldValue, _bps);
+    }
+
+    /**
+     * @notice Sets the minimum bet amount in payment token units
+     * @param _minBetAmount The new minimum bet amount
+     */
+    function setMinBetAmount(uint256 _minBetAmount) external onlyOwner {
+        require(_minBetAmount >= 0, "Minimum bet amount cannot be negative");
+        uint256 oldValue = minBetAmount;
+        minBetAmount = _minBetAmount;
+        emit MinBetAmountUpdated(oldValue, _minBetAmount);
+    }
+
+    /**
+     * @notice Sets the maximum bet amount in payment token units
+     * @param _maxBetAmount The new maximum bet amount
+     */
+    function setMaxBetAmount(uint256 _maxBetAmount) external onlyOwner {
+        require(_maxBetAmount >= minBetAmount, "Maximum bet amount must be greater than or equal to minimum bet amount");
+        uint256 oldValue = maxBetAmount;
+        maxBetAmount = _maxBetAmount;
+        emit MaxBetAmountUpdated(oldValue, _maxBetAmount);
     }
 } 

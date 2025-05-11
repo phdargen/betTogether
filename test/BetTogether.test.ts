@@ -141,14 +141,15 @@ describe("BetTogether with Viem", function () {
             
             // Parameters for the bet
             const takesYesPosition = true;
-            const amount = parseUnits("1", 18); // 1 token with 18 decimals
+            const amount = parseUnits("1", 6); 
             const priceToleranceBps = 500; // 5% tolerance
+            const rewardAmount = 0n; // Add missing reward amount parameter
             
             // Attempt to create a bet with the random address should fail
             // because the TruthMarketManager should not recognize it as an active market
             await expect(
                 betTogether.write.createBet(
-                    [randomAddress, takesYesPosition, amount, priceToleranceBps], 
+                    [randomAddress, takesYesPosition, amount, priceToleranceBps, rewardAmount], 
                     { account: owner.account! }
                 )
             ).to.be.rejectedWith("Not an active TruthMarket");
@@ -563,7 +564,7 @@ describe("BetTogether with Viem", function () {
             
             // Now try the actual createBet call
             hash = await betTogether.write.createBet(
-                [betParams.marketAddress, betParams.takesYesPosition, betParams.amount, betParams.priceToleranceBps],
+                [betParams.marketAddress, betParams.takesYesPosition, betParams.amount, betParams.priceToleranceBps, 0n],
                 { 
                     account: owner.account!,
                     gas: 3000000n // Increase gas limit
@@ -580,11 +581,11 @@ describe("BetTogether with Viem", function () {
             
             // Check balances to confirm tokens were transferred
             const ownerUsdcAfter = await paymentToken.read.balanceOf([owner.account!.address]);
-            const difference = BigInt(ownerBalanceBefore) - BigInt(ownerUsdcAfter);
-            console.log(`USDC spent in transaction: ${formatUnits(difference, paymentTokenDecimals)}`);
+            const balanceDiff = BigInt(ownerBalanceBefore) - BigInt(ownerUsdcAfter);
+            console.log(`USDC spent in transaction: ${formatUnits(balanceDiff, paymentTokenDecimals)}`);
             
             // Verify the difference matches the transferred amount (within reasonable tolerance for gas costs)
-            expect(Number(difference)).to.be.greaterThanOrEqual(Number(betParams.amount));
+            expect(Number(balanceDiff)).to.be.greaterThanOrEqual(Number(betParams.amount));
             
             // Check if betId 0 exists in the contract by querying it directly
             try {
@@ -625,6 +626,9 @@ describe("BetTogether with Viem", function () {
             
             console.log("\n--- Testing Full Bet Workflow ---");
             
+            // Declaration for hash variable
+            let hash: `0x${string}`;
+            
             // Check deployer (owner) balance to ensure we have USDC
             const ownerBalanceBefore = await paymentToken.read.balanceOf([owner.account!.address]);
             console.log(`Deployer balance: ${formatUnits(ownerBalanceBefore, paymentTokenDecimals)} USDC`);
@@ -639,7 +643,7 @@ describe("BetTogether with Viem", function () {
             // Transfer sufficient USDC to addr1 for testing
             if (addr1.account) {
                 console.log("\nTransferring USDC to addr1 for testing");
-                let hash = await paymentToken.write.transfer(
+                hash = await paymentToken.write.transfer(
                     [addr1.account.address, parseUnits("0.2", paymentTokenDecimals)],
                     { account: owner.account! }
                 );
@@ -652,7 +656,7 @@ describe("BetTogether with Viem", function () {
             // Also transfer some USDC to addr2 to test multiple acceptors
             if (addr2.account) {
                 console.log("Transferring USDC to addr2 for testing");
-                const hash = await paymentToken.write.transfer(
+                hash = await paymentToken.write.transfer(
                     [addr2.account.address, parseUnits("0.1", paymentTokenDecimals)],
                     { account: owner.account! }
                 );
@@ -673,7 +677,7 @@ describe("BetTogether with Viem", function () {
             
             // Owner approves for bet creation
             const ownerApprovalAmount = parseUnits("0.2", paymentTokenDecimals);
-            let hash = await paymentToken.write.approve(
+            hash = await paymentToken.write.approve(
                 [betTogether.address, ownerApprovalAmount],
                 { account: owner.account!, chain: null }
             );
@@ -707,6 +711,7 @@ describe("BetTogether with Viem", function () {
             console.log("\nCreating bet on TruthMarket");
             
             const initiatorAmount = parseUnits("0.1", paymentTokenDecimals);
+            const rewardAmount = parseUnits("0.005", paymentTokenDecimals); // 0.005 USDC reward
             const priceToleranceBps = 1000; // 10% tolerance (maximum)
             
             const betParams = {
@@ -723,18 +728,18 @@ describe("BetTogether with Viem", function () {
                 priceToleranceBps: betParams.priceToleranceBps
             });
             
-            // Create the bet
+            // Create a bet with reward
+            console.log("\nCreating bet with reward of", formatUnits(rewardAmount, paymentTokenDecimals), "USDC");
+
             hash = await betTogether.write.createBet(
                 [
-                    betParams.marketAddress, 
-                    betParams.takesYesPosition, 
-                    betParams.amount, 
-                    betParams.priceToleranceBps
+                    truthMarketAddress, 
+                    true, // YES position
+                    initiatorAmount, 
+                    1000n, // 10% tolerance - use BigInt for consistency
+                    rewardAmount
                 ],
-                { 
-                    account: owner.account!,
-                    gas: 3000000n // Increase gas limit
-                }
+                { account: owner.account!, gas: 3000000n }
             );
             
             const receipt = await publicClient.waitForTransactionReceipt({ hash });
@@ -760,15 +765,16 @@ describe("BetTogether with Viem", function () {
             console.log("\naddr1 accepting the bet...");
             const maxAcceptorDeposit = parseUnits("0.5", paymentTokenDecimals); // High enough limit for expectedCounterpartyAmount
             const acceptDeadline = BigInt(Math.floor(Date.now() / 1000) + 3600); // 1 hour from now
-            hash = await betTogether.write.acceptBet(
+            
+            const acceptHash = await betTogether.write.acceptBet(
                 [betId, maxAcceptorDeposit, acceptDeadline],
                 { 
                     account: addr1.account!,
-                    gas: 4000000n // Increase gas limit
+                    gas: 4000000n
                 }
             );
             
-            const acceptReceipt = await publicClient.waitForTransactionReceipt({ hash });
+            const acceptReceipt = await publicClient.waitForTransactionReceipt({ hash: acceptHash });
             expect(acceptReceipt.status).to.equal('success', "Accept transaction failed");
             
             // 6. Try to accept the same bet with addr2 (should fail)
@@ -842,6 +848,265 @@ describe("BetTogether with Viem", function () {
             
             console.log("\nFull bet workflow test completed successfully!");
         });
+
+        it("Should correctly collect platform fees during bet execution", async function() {
+            // Skip the test if we previously had setup issues
+            if (!truthMarketContract || !paymentToken || !yesToken || !noToken) {
+                this.skip();
+                return;
+            }
+            
+            console.log("\n--- Testing Platform Fee Collection ---");
+            
+            // Declaration for hash variable
+            let hash: `0x${string}`;
+            
+            // Setup a 2% platform fee
+            const platformFeeBps = 200n; // 2%
+            hash = await betTogether.write.setPlatformFee([platformFeeBps], { account: owner.account! });
+            await publicClient.waitForTransactionReceipt({ hash });
+            
+            // Check owner's initial balance
+            const ownerInitialBalance = await paymentToken.read.balanceOf([owner.account!.address]);
+            console.log(`Owner initial balance: ${formatUnits(ownerInitialBalance, paymentTokenDecimals)} USDC`);
+            
+            // Transfer USDC to addr1 for the test
+            if (addr1.account) {
+                hash = await paymentToken.write.transfer(
+                    [addr1.account.address, parseUnits("0.2", paymentTokenDecimals)],
+                    { account: owner.account! }
+                );
+                await publicClient.waitForTransactionReceipt({ hash });
+            }
+            
+            // Approve USDC spending
+            await paymentToken.write.approve(
+                [betTogether.address, parseUnits("0.2", paymentTokenDecimals)],
+                { account: owner.account! }
+            );
+            
+            await paymentToken.write.approve(
+                [betTogether.address, parseUnits("0.2", paymentTokenDecimals)],
+                { account: addr1.account! }
+            );
+            
+            // Create a bet with correct parameter types
+            const betAmount = parseUnits("0.1", paymentTokenDecimals);
+            const priceToleranceBpsValue = 1000n; // 10% tolerance - using BigInt
+            const rewardAmount = 0n; // Add reward amount parameter
+            
+            hash = await betTogether.write.createBet(
+                [truthMarketAddress, true, betAmount, priceToleranceBpsValue, rewardAmount],
+                { account: owner.account! }
+            );
+            await publicClient.waitForTransactionReceipt({ hash });
+            const betId = await betTogether.read.nextBetId() - 1n;
+            
+            // Accept the bet
+            const fairAmount = await betTogether.read.getFairCounterpartyAmount([betId]);
+            
+            // Get current block timestamp and set deadline 1 hour in the future
+            const currentBlockTimestamp: number = await time.latest();
+            const deadlineTimestamp = BigInt(currentBlockTimestamp + 3600); // 1 hour from now
+            
+            hash = await betTogether.write.acceptBet(
+                [betId, fairAmount * 2n, deadlineTimestamp],
+                { account: addr1.account! }
+            );
+            
+            // Wait for transaction to be mined
+            const acceptReceipt = await publicClient.waitForTransactionReceipt({ hash });
+            expect(acceptReceipt.status).to.equal('success', "Accept transaction failed");
+            
+            // Check for fee collection event
+            const feeEvents = await betTogether.getEvents.PlatformFeesCollected();
+            expect(feeEvents.length).to.be.greaterThan(0, "No PlatformFeesCollected event emitted");
+            
+            // Calculate expected fee
+            const totalAmount = betAmount + fairAmount;
+            const expectedFee = (totalAmount * platformFeeBps) / 10000n;
+            console.log(`Expected fee: ${formatUnits(expectedFee, paymentTokenDecimals)} USDC`);
+            
+            // Check owner's final balance
+            const ownerFinalBalance = await paymentToken.read.balanceOf([owner.account!.address]);
+            console.log(`Owner final balance: ${formatUnits(ownerFinalBalance, paymentTokenDecimals)} USDC`);
+            
+            // Validate owner received fees - Since the owner is also the bettor in this test,
+            // we need to account for other transfers. So we're just ensuring the balance increased.
+            const balanceDiff = BigInt(ownerFinalBalance) - BigInt(ownerInitialBalance);
+            console.log(`Owner balance change: ${formatUnits(balanceDiff, paymentTokenDecimals)} USDC`);
+
+            // The fee should be somewhere in the event
+            const actualFee = feeEvents[feeEvents.length - 1].args.feeAmount;
+            console.log(`Actual fee from event: ${formatUnits(actualFee, paymentTokenDecimals)} USDC`);
+            
+            // The actual fee should be the expected fee (within a small margin for rounding)
+            const feeDifference = actualFee > expectedFee 
+                ? actualFee - expectedFee 
+                : expectedFee - actualFee;
+                
+            // Expect the fee to be within 1 wei of the expected value
+            expect(Number(feeDifference)).to.be.lessThanOrEqual(1);
+        });
+
+        it("Should distribute rewards correctly when a bet with reward is accepted", async function() {
+            // Skip the test if we previously had setup issues
+            if (!truthMarketContract || !paymentToken || !yesToken || !noToken) {
+                this.skip();
+                return;
+            }
+            
+            console.log("\n--- Testing Bet Reward Distribution ---");
+            
+            // Declaration for hash variable
+            let hash: `0x${string}`;
+            
+            // Setup accounts and balances
+            const initiatorAmount = parseUnits("0.1", paymentTokenDecimals);
+            const rewardAmount = parseUnits("0.005", paymentTokenDecimals); // 0.005 USDC reward
+            
+            // Transfer USDC to addr1 for testing
+            if (addr1.account) {
+                let hash = await paymentToken.write.transfer(
+                    [addr1.account.address, parseUnits("0.2", paymentTokenDecimals)],
+                    { account: owner.account! }
+                );
+                await publicClient.waitForTransactionReceipt({ hash });
+                
+                const addr1Balance = await paymentToken.read.balanceOf([addr1.account.address]);
+                console.log(`addr1 balance: ${formatUnits(addr1Balance, paymentTokenDecimals)} USDC`);
+            }
+            
+            // Owner approves for bet creation + reward
+            await paymentToken.write.approve(
+                [betTogether.address, initiatorAmount + rewardAmount],
+                { account: owner.account! }
+            );
+            
+            // addr1 approves for bet acceptance
+            await paymentToken.write.approve(
+                [betTogether.address, parseUnits("1", paymentTokenDecimals)], // Large enough for any acceptance
+                { 
+                    account: addr1.account!,
+                    gas: 2000000n
+                }
+            );
+            
+            // Record initial balances
+            const addr1InitialBalance = await paymentToken.read.balanceOf([addr1.account!.address]);
+            console.log(`addr1 initial balance: ${formatUnits(addr1InitialBalance, paymentTokenDecimals)} USDC`);
+            
+            // Create a bet with reward
+            console.log("\nCreating bet with reward of", formatUnits(rewardAmount, paymentTokenDecimals), "USDC");
+
+            const betCreateHash = await betTogether.write.createBet(
+                [
+                    truthMarketAddress, 
+                    true, // YES position
+                    initiatorAmount, 
+                    1000n, // 10% tolerance - use BigInt for consistency
+                    rewardAmount
+                ],
+                { account: owner.account!, gas: 3000000n }
+            );
+            
+            const receipt = await publicClient.waitForTransactionReceipt({ hash: betCreateHash });
+            expect(receipt.status).to.equal('success', "Transaction failed");
+            
+            // Get the betId from the event
+            const betId = await betTogether.read.nextBetId() - 1n;
+            
+            // Verify the bet has the reward set
+            const betDetails = await betTogether.read.getBet([betId]);
+            console.log("\nBet created with reward:", formatUnits(betDetails[10], paymentTokenDecimals), "USDC");
+            expect(betDetails[10]).to.equal(rewardAmount, "Reward not stored correctly");
+            
+            // Calculate expected counterparty amount
+            const fairAmount = await betTogether.read.getFairCounterpartyAmount([betId]);
+            console.log(`Expected counterparty amount: ${formatUnits(fairAmount, paymentTokenDecimals)} USDC`);
+            
+            // addr1 accepts the bet
+            console.log("\naddr1 accepting the bet...");
+            const acceptDeadline = BigInt(Math.floor(Date.now() / 1000) + 3600); // 1 hour from now
+            
+            const acceptHash = await betTogether.write.acceptBet(
+                [betId, fairAmount * 2n, acceptDeadline],
+                { 
+                    account: addr1.account!,
+                    gas: 4000000n
+                }
+            );
+            
+            const acceptReceipt = await publicClient.waitForTransactionReceipt({ hash: acceptHash });
+            expect(acceptReceipt.status).to.equal('success', "Accept transaction failed");
+            
+            // Check for reward event
+            const rewardEvents = await betTogether.getEvents.RewardPaid();
+            expect(rewardEvents.length).to.be.greaterThan(0, "No RewardPaid event emitted");
+            
+            // Verify the reward amount from the event
+            const lastRewardEvent = rewardEvents[rewardEvents.length - 1];
+            expect(lastRewardEvent.args.betId).to.equal(betId);
+            expect(lastRewardEvent.args.acceptor.toLowerCase()).to.equal(addr1.account!.address.toLowerCase());
+            expect(lastRewardEvent.args.rewardAmount).to.equal(rewardAmount);
+            
+            // Check addr1's balance after the transaction to verify reward was received
+            const addr1FinalBalance = await paymentToken.read.balanceOf([addr1.account!.address]);
+            console.log(`addr1 final balance: ${formatUnits(addr1FinalBalance, paymentTokenDecimals)} USDC`);
+            
+            // Calculate expected balance change
+            // addr1 spent fairAmount to accept the bet, but received rewardAmount as reward
+            // So net change should be: initialBalance - fairAmount + rewardAmount
+            const expectedAddr1Balance = BigInt(addr1InitialBalance) - BigInt(fairAmount) + BigInt(rewardAmount);
+            
+            // Allow a small margin of error for gas costs in the calculation
+            const balanceDiff = addr1FinalBalance > expectedAddr1Balance 
+                ? addr1FinalBalance - expectedAddr1Balance 
+                : expectedAddr1Balance - addr1FinalBalance;
+            
+            const errorMargin = parseUnits("0.001", paymentTokenDecimals); // 0.001 USDC error margin
+            expect(Number(balanceDiff)).to.be.lessThanOrEqual(Number(errorMargin), "Reward distribution incorrect");
+            
+            console.log("\nReward distributed successfully!");
+            
+            // Also verify both parties received the correct prediction market tokens
+            const ownerYesBalance = await yesToken.read.balanceOf([owner.account!.address]);
+            const addr1NoBalance = await noToken.read.balanceOf([addr1.account!.address]);
+            
+            expect(BigInt(ownerYesBalance) > 0n).to.be.true;
+            expect(BigInt(addr1NoBalance) > 0n).to.be.true;
+            
+            console.log(`Owner received: ${ownerYesBalance} YES tokens`);
+            console.log(`addr1 received: ${addr1NoBalance} NO tokens`);
+        });
+    });
+
+    describe("Platform Fee", function () {
+        it("Should allow owner to set platform fee and emit event", async function () {
+            const newFee = 50n; // 0.5%
+            
+            const hash = await betTogether.write.setPlatformFee([newFee], { account: owner.account! });
+            await publicClient.waitForTransactionReceipt({ hash });
+            
+            const feeUpdatedEvents = await betTogether.getEvents.PlatformFeeUpdated();
+            expect(feeUpdatedEvents).to.have.lengthOf(1);
+            expect(BigInt(feeUpdatedEvents[0].args.oldValue)).to.equal(0n);
+            expect(BigInt(feeUpdatedEvents[0].args.newValue)).to.equal(newFee);
+
+            const currentFee = await betTogether.read.platformFeeBps();
+            expect(BigInt(currentFee)).to.equal(newFee);
+        });
+
+        it("Should prevent non-owner from setting platform fee", async function () {
+            const newFee = 100n; // 1%
+            await expect(betTogether.write.setPlatformFee([newFee], { account: addr1.account! }))
+                .to.be.rejectedWith(/OwnableUnauthorizedAccount/); 
+        });
+
+        it("Should revert if setting platform fee above 500 BPS (5%)", async function () {
+            await expect(betTogether.write.setPlatformFee([501n], { account: owner.account! }))
+                .to.be.rejectedWith("Fee cannot exceed 5%");
+        });
     });
 
     describe("Safety Features", function() {
@@ -861,6 +1126,9 @@ describe("BetTogether with Viem", function () {
         });
 
         it("should reject accepting a bet when maxDeposit is too low", async function() {
+            // Declaration for hash variable
+            let hash: `0x${string}`;
+            
             // Create a bet first
             const takesYesPosition = true;
             const priceToleranceBps = 1000; // 10% tolerance
@@ -892,7 +1160,7 @@ describe("BetTogether with Viem", function () {
             
             // Create a bet
             const createHash = await betTogether.write.createBet(
-                [truthMarketAddress, takesYesPosition, initiatorAmount, priceToleranceBps],
+                [truthMarketAddress, takesYesPosition, initiatorAmount, priceToleranceBps, 0n], // Add 0n as rewardAmount
                 { account: owner.account!, chain: null } // Added chain: null here as well for consistency
             );
             await publicClient.waitForTransactionReceipt({ hash: createHash });
@@ -924,6 +1192,9 @@ describe("BetTogether with Viem", function () {
         });
         
         it("should reject accepting a bet when deadline has passed", async function() {
+            // Declaration for hash variable
+            let hash: `0x${string}`;
+            
             // Get the market and payment token contracts first to get decimals
             const truthMarketContract_deadlineTest = getContract({
                 abi: truthMarketMinimalAbi,
@@ -968,7 +1239,7 @@ describe("BetTogether with Viem", function () {
             
             // Create a bet
             const createHash = await betTogether.write.createBet(
-                [truthMarketAddress, takesYesPosition, initiatorAmount, priceToleranceBps],
+                [truthMarketAddress, takesYesPosition, initiatorAmount, priceToleranceBps, 0n], // Add 0n as rewardAmount
                 { account: owner.account!, chain: null }
             );
             await publicClient.waitForTransactionReceipt({ hash: createHash });
