@@ -87,6 +87,13 @@ This design provides a simple yet effective solution for users to enter predicti
 npx hardhat help
 npx hardhat compile
 npx hardhat test test/BetTogether.test.ts
-npx hardhat run scripts/deploy.ts --network baseSepolia
-npx hardhat verify --network baseSepolia DEPLOYED_CONTRACT_ADDRESS
+npx hardhat run scripts/deploy.ts --network base
+npx hardhat verify --network base DEPLOYED_CONTRACT_ADDRESS 0x61A98Bef11867c69489B91f340fE545eEfc695d7
+```
+
+## Deployed contract
+
+```shell
+0xca6a590501e675fe223aa5704956c77e890aab31
+https://basescan.org/address/0xca6a590501e675fe223aa5704956c77e890aab31#code
 ```
