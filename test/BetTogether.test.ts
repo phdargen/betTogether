@@ -49,7 +49,8 @@ describe("BetTogether with Viem", function () {
         });
 
         it("Should have POOL_CONSISTENCY_TOLERANCE_BPS initialized", async function () {
-            expect(await betTogether.read.POOL_CONSISTENCY_TOLERANCE_BPS()).to.equal(50n); // Default value, ensure bigint comparison
+            const tolerance = await betTogether.read.POOL_CONSISTENCY_TOLERANCE_BPS();
+            expect(BigInt(tolerance)).to.equal(50n); // Convert to BigInt before comparison
         });
     });
 
@@ -77,8 +78,6 @@ describe("BetTogether with Viem", function () {
                 
                 const sumPrice = yesPrice + noPrice;
                 expect(sumPrice).to.equal(PRICE_PRECISION, "Sum of YES and NO prices should equal PRICE_PRECISION");
-
-                console.log("Price assertions passed. If you saw this, getPoolPrices executed without arithmetic overflow for this market.");
 
             } catch (error: any) {
                 console.error("Error calling getPoolPrices:", error);
@@ -141,10 +140,11 @@ describe("BetTogether with Viem", function () {
             // Fetch and assert event (style from Lock.ts)
             const toleranceUpdatedEvents = await betTogether.getEvents.PoolConsistencyToleranceUpdated();
             expect(toleranceUpdatedEvents).to.have.lengthOf(1);
-            expect(toleranceUpdatedEvents[0].args.oldValue).to.equal(initialTolerance);
-            expect(toleranceUpdatedEvents[0].args.newValue).to.equal(newTolerance);
+            expect(BigInt(toleranceUpdatedEvents[0].args.oldValue)).to.equal(BigInt(initialTolerance));
+            expect(BigInt(toleranceUpdatedEvents[0].args.newValue)).to.equal(newTolerance);
 
-            expect(await betTogether.read.POOL_CONSISTENCY_TOLERANCE_BPS()).to.equal(newTolerance);
+            const updatedTolerance = await betTogether.read.POOL_CONSISTENCY_TOLERANCE_BPS();
+            expect(BigInt(updatedTolerance)).to.equal(newTolerance);
         });
 
         it("Should prevent non-owner from setting pool consistency tolerance", async function () {
