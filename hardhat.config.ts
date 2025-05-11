@@ -29,7 +29,8 @@ module.exports = {
           url: process.env.RPC_URL_BASE || DEFAULT_RPC_URL,
           blockNumber: 30064146,
         },
-        chainId: 8453
+        chainId: 8453,
+        accounts: { mnemonic: process.env.MNEMONIC || DEFAULT_MNEMONIC }
       },
       base: {
         url: process.env.RPC_URL_BASE || DEFAULT_RPC_URL,

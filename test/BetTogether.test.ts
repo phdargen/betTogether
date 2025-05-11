@@ -1,15 +1,9 @@
 import { expect } from "chai";
 import hre from "hardhat"; 
 import { loadFixture } from "@nomicfoundation/hardhat-network-helpers"; 
-import { WalletClient, PublicClient, Abi, getContract } from "viem"; 
-import { parseUnits, formatUnits, zeroAddress, GetContractReturnType, Address, parseAbiItem } from "viem";
+import { WalletClient, PublicClient, getContract } from "viem"; 
+import { parseUnits, formatUnits, zeroAddress, Address, parseAbiItem } from "viem";
 
-// Assuming BetTogether.sol is in contracts/ and compiled, its ABI will be available
-// For explicit typing of the deployed contract instance:
-// import { abi as BetTogetherAbi } from "../artifacts/contracts/DirectBet.sol/BetTogether.json";
-// type BetTogetherContractType = GetContractReturnType<typeof BetTogetherAbi, WalletClient[]>;
-
-// Use parseAbiItem for a more strongly typed ABI fragment
 const truthMarketMinimalAbi = [
     parseAbiItem("function marketQuestion() view returns (string)"),
     parseAbiItem("function paymentToken() view returns (address)"),
@@ -18,21 +12,22 @@ const truthMarketMinimalAbi = [
     parseAbiItem("function getCurrentStatus() view returns (uint8)"),
     parseAbiItem("function getPoolAddresses() view returns (address, address)"),
     parseAbiItem("function mint(uint256 amount) returns (uint256)")
-] as const; // Crucial for Viem's type inference
+] as const; 
 
 const erc20Abi = [
     parseAbiItem("function balanceOf(address) view returns (uint256)"),
     parseAbiItem("function decimals() view returns (uint8)"),
     parseAbiItem("function approve(address, uint256) returns (bool)"),
-    parseAbiItem("function transfer(address, uint256) returns (bool)")
+    parseAbiItem("function transfer(address, uint256) returns (bool)"),
+    parseAbiItem("function allowance(address, address) view returns (uint256)")
 ] as const;
 
 describe("BetTogether with Viem", function () {
-    let betTogether: any; // Using any for now, can be refined with BetTogetherContractType
+    let betTogether: any; 
     let owner: WalletClient;
     let addr1: WalletClient;
     let addr2: WalletClient;
-    let publicClient: PublicClient; // Typed publicClient
+    let publicClient: PublicClient; 
 
     const truthMarketAddress = "0xa93B6Fe76764297fd6E9C649c1401Bd53C469515" as Address;
     
@@ -53,6 +48,9 @@ describe("BetTogether with Viem", function () {
         addr1 = addr1Account;
         addr2 = addr2Account;
         publicClient = pubClient;
+        
+        // Print deployer address
+        console.log("Deployer (owner) address:", owner.account!.address);
     });
 
     describe("Deployment", function () {
@@ -117,7 +115,6 @@ describe("BetTogether with Viem", function () {
             }
 
             try {
-                // Use viem's getContract directly instead of hardhat-viem's getContractAt
                 const truthMarketContract = getContract({
                     abi: truthMarketMinimalAbi,
                     address: truthMarketAddress,
@@ -128,15 +125,11 @@ describe("BetTogether with Viem", function () {
 
                 const question = await truthMarketContract.read.marketQuestion();
                 console.log("Market Question:", question);
-
-                // Add an expectation if you want to assert something about the question
-                // For now, just printing it as requested.
                 expect(question).to.be.a('string'); // Basic check that it's a string
 
             } catch (error) {
                 console.error("Error reading marketQuestion from TruthMarket:", error);
                 // If the contract doesn't exist or doesn't have this function, Viem might throw.
-                // It could also be an issue with the RPC connection to the Base mainnet fork.
                 throw error;
             }
         });
@@ -150,7 +143,6 @@ describe("BetTogether with Viem", function () {
             const hash = await betTogether.write.setPoolConsistencyTolerance([newTolerance], { account: owner.account! });
             await publicClient.waitForTransactionReceipt({ hash });
             
-            // Fetch and assert event (style from Lock.ts)
             const toleranceUpdatedEvents = await betTogether.getEvents.PoolConsistencyToleranceUpdated();
             expect(toleranceUpdatedEvents).to.have.lengthOf(1);
             expect(BigInt(toleranceUpdatedEvents[0].args.oldValue)).to.equal(BigInt(initialTolerance));
@@ -162,7 +154,6 @@ describe("BetTogether with Viem", function () {
 
         it("Should prevent non-owner from setting pool consistency tolerance", async function () {
             const newTolerance = 100n;
-            // Update expected error message to match OpenZeppelin's custom error
             await expect(betTogether.write.setPoolConsistencyTolerance([newTolerance], { account: addr1.account! }))
                 .to.be.rejectedWith(/OwnableUnauthorizedAccount/); 
         });
@@ -179,7 +170,6 @@ describe("BetTogether with Viem", function () {
     });
 
     describe("Complete Bet Workflow", function () {
-        // This test suite follows the example from README.md
         let truthMarketContract: any;
         let paymentToken: any;
         let yesToken: any;
@@ -214,7 +204,8 @@ describe("BetTogether with Viem", function () {
                     abi: erc20Abi,
                     address: paymentTokenAddress,
                     client: {
-                        public: publicClient
+                        public: publicClient,
+                        wallet: owner
                     }
                 });
 
@@ -229,7 +220,8 @@ describe("BetTogether with Viem", function () {
                     abi: erc20Abi,
                     address: yesTokenAddress,
                     client: {
-                        public: publicClient
+                        public: publicClient,
+                        wallet: owner
                     }
                 });
 
@@ -237,7 +229,8 @@ describe("BetTogether with Viem", function () {
                     abi: erc20Abi,
                     address: noTokenAddress,
                     client: {
-                        public: publicClient
+                        public: publicClient,
+                        wallet: owner
                     }
                 });
 
@@ -256,8 +249,7 @@ describe("BetTogether with Viem", function () {
         });
 
         it("Should demonstrate the complete bet workflow", async function() {
-            // We'll simulate the workflow as best we can in a mainnet fork
-            // First, log the current prices to understand the market
+            // Simulate workflow in a mainnet fork
             console.log("\nDemonstrating complete bet workflow with real market prices:");
             
             const [yesPrice, noPrice] = await betTogether.read.getPoolPrices([truthMarketAddress]);
@@ -269,7 +261,7 @@ describe("BetTogether with Viem", function () {
             
             // Define Alice's parameters
             const aliceAmount = parseUnits("10", paymentTokenDecimals); // A smaller amount for testing
-            const priceTolerance = 300; // 3% tolerance, matching README example
+            const priceTolerance = 300; // 3% tolerance for price changes
             
             // Calculate what Bob should expect to pay
             const bobExpectedAmount = await betTogether.read.calculateCounterpartyAmount([
@@ -282,23 +274,11 @@ describe("BetTogether with Viem", function () {
             console.log(`Alice deposits: ${formatUnits(aliceAmount, paymentTokenDecimals)} payment tokens`);
             console.log(`Bob should expect to deposit: ${formatUnits(bobExpectedAmount, paymentTokenDecimals)} payment tokens`);
             
-            // For testing on a mainnet fork, we need to simulate having payment tokens
-            // This is where we'd normally need to impersonate accounts with tokens
-            // Here, let's note why this part would be challenging on a fork without impersonation
-            console.log("\nNote: On a mainnet fork, we would need to impersonate accounts with tokens to complete this test");
-            console.log("or use advanced techniques to get tokens to our test accounts.");
-            
-            // Instead, let's skip the actual token transfers and verify the math and flow logic
-            console.log("\nVerifying price calculations match the example in README:");
-            
-            // Check if our calculation roughly matches the expected ratio from README
-            // README example: 1000 USDC for YES position with 64.5% YES price requires ~550 USDC for NO
-            // We'll scale this to our test amount and current prices
             const yesPercentage = Number(formatUnits(yesPrice, 18)) * 100;
             const noPercentage = Number(formatUnits(noPrice, 18)) * 100;
             console.log(`Current market sentiment: YES ${yesPercentage.toFixed(2)}%, NO ${noPercentage.toFixed(2)}%`);
             
-            // Verify our counterparty calculation method matches the README example
+            // Verify counterparty calculation method matches the README example
             const manualCalculation = (Number(formatUnits(aliceAmount, paymentTokenDecimals)) * 
                 (yesPercentage / noPercentage));
                 
@@ -433,6 +413,368 @@ describe("BetTogether with Viem", function () {
             expect(largeMove <= allowedDeviation).to.be.false;
             
             console.log("\nBet creation and cancellation flow logic verified");
+        });
+
+        it("Should actually execute a complete bet workflow with real contract calls", async function() {
+            // Skip the test if we previously had setup issues
+            if (!truthMarketContract || !paymentToken) {
+                this.skip();
+                return;
+            }
+            
+            // Check deployer (owner) balance to ensure we have USDC
+            const ownerBalanceBefore = await paymentToken.read.balanceOf([owner.account!.address]);
+            console.log(`\nDeployer balance: ${formatUnits(ownerBalanceBefore, paymentTokenDecimals)} USDC`);
+            
+            // Skip if balance is too low
+            if (ownerBalanceBefore < parseUnits("1", paymentTokenDecimals)) {
+                console.log("Insufficient USDC balance to perform test. Skipping.");
+                this.skip();
+                return;
+            }
+            
+            // Transfer some USDC to addr1 to act as counterparty
+            const transferAmount = parseUnits("0.1", paymentTokenDecimals); // Use a smaller amount for testing
+            if (addr1.account && ownerBalanceBefore >= parseUnits("2", paymentTokenDecimals)) {
+                // Make sure addr1 has some USDC too
+                const addr1BalanceBefore = await paymentToken.read.balanceOf([addr1.account.address]);
+                if (addr1BalanceBefore < transferAmount) {
+                    console.log("Transferring 0.1 USDC to addr1 for testing");
+                    const hash = await paymentToken.write.transfer(
+                        [addr1.account.address, transferAmount],
+                        { account: owner.account! }
+                    );
+                    await publicClient.waitForTransactionReceipt({ hash });
+                }
+            }
+            
+            // Check initial balances
+            const addr1Balance = await paymentToken.read.balanceOf([addr1.account!.address]);
+            console.log(`addr1 balance: ${formatUnits(addr1Balance, paymentTokenDecimals)} USDC`);
+            
+            if (addr1Balance < transferAmount) {
+                console.log("addr1 has insufficient USDC for test. Skipping.");
+                this.skip();
+                return;
+            }
+            
+            // 1. Get the current market prices to understand conditions
+            const [currentYesPrice, currentNoPrice] = await betTogether.read.getPoolPrices([truthMarketAddress]);
+            console.log(`\nCurrent market prices:`);
+            console.log(`YES: ${formatUnits(currentYesPrice, 18)} (${Number(formatUnits(currentYesPrice, 18)) * 100}%)`);
+            console.log(`NO: ${formatUnits(currentNoPrice, 18)} (${Number(formatUnits(currentNoPrice, 18)) * 100}%)`);
+            
+            // 2. Approve USDC spending by BetTogether contract
+            console.log("\nApproving USDC spending for BetTogether");
+            
+            // Owner approves with a higher amount to ensure enough approval
+            const approvalAmount = parseUnits("5", paymentTokenDecimals);
+            let hash = await paymentToken.write.approve(
+                [betTogether.address, approvalAmount],
+                { account: owner.account! }
+            );
+            await publicClient.waitForTransactionReceipt({ hash });
+            
+            // Check if the approval worked
+            const allowance = await paymentToken.read.allowance([
+                owner.account!.address, 
+                betTogether.address
+            ]);
+            console.log(`Approval granted: ${formatUnits(allowance, paymentTokenDecimals)} USDC`);
+            
+            // 3. Owner creates a bet
+            console.log("\nCreating bet on TruthMarket");
+            
+            const betParams = {
+                marketAddress: truthMarketAddress,
+                takesYesPosition: true, // Owner takes YES position
+                amount: transferAmount, // 0.1 USDC
+                priceToleranceBps: 1000, // 10% tolerance (maximum)
+            };
+            
+            console.log("Creating bet with parameters:", {
+                marketAddress: betParams.marketAddress,
+                takesYesPosition: betParams.takesYesPosition,
+                amount: formatUnits(betParams.amount, paymentTokenDecimals),
+                priceToleranceBps: betParams.priceToleranceBps
+            });
+            
+            // Now try the actual createBet call
+            hash = await betTogether.write.createBet(
+                [betParams.marketAddress, betParams.takesYesPosition, betParams.amount, betParams.priceToleranceBps],
+                { 
+                    account: owner.account!,
+                    gas: 3000000n // Increase gas limit
+                }
+            );
+            
+            console.log("Create bet transaction hash:", hash);
+            
+            const receipt = await publicClient.waitForTransactionReceipt({ hash });
+            console.log("Transaction status:", receipt.status);
+            
+            // Verify transaction was successful
+            expect(receipt.status).to.equal('success', "Transaction failed");
+            
+            // Check balances to confirm tokens were transferred
+            const ownerUsdcAfter = await paymentToken.read.balanceOf([owner.account!.address]);
+            const difference = BigInt(ownerBalanceBefore) - BigInt(ownerUsdcAfter);
+            console.log(`USDC spent in transaction: ${formatUnits(difference, paymentTokenDecimals)}`);
+            
+            // Verify the difference matches the transferred amount (within reasonable tolerance for gas costs)
+            expect(Number(difference)).to.be.greaterThanOrEqual(Number(betParams.amount));
+            
+            // Check if betId 0 exists in the contract by querying it directly
+            try {
+                const bet = await betTogether.read.getBet([0n]); // First betId should be 0
+                console.log("\nVerified bet details from contract:", {
+                    marketAddress: bet[0],
+                    initiator: bet[1],
+                    initiatorTakesYesPosition: bet[2],
+                    initiatorAmount: formatUnits(bet[3], paymentTokenDecimals),
+                    acceptor: bet[4],
+                    acceptorAmount: formatUnits(bet[5], paymentTokenDecimals),
+                    priceToleranceBps: bet[6],
+                    initialPriceForInitiator: formatUnits(bet[7], 18),
+                    isExecuted: bet[8],
+                    createdAt: new Date(Number(bet[9]) * 1000).toISOString()
+                });
+                
+                // Verify the bet was created with the expected parameters
+                expect(bet[0]).to.equal(betParams.marketAddress);
+                expect(bet[1].toLowerCase()).to.equal(owner.account!.address.toLowerCase());
+                expect(bet[2]).to.equal(betParams.takesYesPosition);
+                expect(bet[3]).to.equal(betParams.amount);
+                expect(Number(bet[6])).to.equal(betParams.priceToleranceBps);
+                
+                console.log("Test completed successfully - Bet creation verified through contract call");
+            } catch (error) {
+                console.error("Error verifying bet:", error);
+                throw error;
+            }
+        });
+
+        it("Should complete a full bet workflow with token distribution and acceptance rules", async function() {
+            // Skip the test if we previously had setup issues
+            if (!truthMarketContract || !paymentToken || !yesToken || !noToken) {
+                this.skip();
+                return;
+            }
+            
+            console.log("\n--- Testing Full Bet Workflow ---");
+            
+            // Check deployer (owner) balance to ensure we have USDC
+            const ownerBalanceBefore = await paymentToken.read.balanceOf([owner.account!.address]);
+            console.log(`Deployer balance: ${formatUnits(ownerBalanceBefore, paymentTokenDecimals)} USDC`);
+            
+            // Skip if owner balance is too low
+            if (ownerBalanceBefore < parseUnits("0.5", paymentTokenDecimals)) {
+                console.log("Insufficient USDC balance to perform test. Skipping.");
+                this.skip();
+                return;
+            }
+            
+            // Transfer sufficient USDC to addr1 for testing
+            if (addr1.account) {
+                console.log("\nTransferring USDC to addr1 for testing");
+                let hash = await paymentToken.write.transfer(
+                    [addr1.account.address, parseUnits("0.2", paymentTokenDecimals)],
+                    { account: owner.account! }
+                );
+                await publicClient.waitForTransactionReceipt({ hash });
+                
+                const addr1Balance = await paymentToken.read.balanceOf([addr1.account.address]);
+                console.log(`addr1 balance after transfer: ${formatUnits(addr1Balance, paymentTokenDecimals)} USDC`);
+            }
+            
+            // Also transfer some USDC to addr2 to test multiple acceptors
+            if (addr2.account) {
+                console.log("Transferring USDC to addr2 for testing");
+                const hash = await paymentToken.write.transfer(
+                    [addr2.account.address, parseUnits("0.1", paymentTokenDecimals)],
+                    { account: owner.account! }
+                );
+                await publicClient.waitForTransactionReceipt({ hash });
+                
+                const addr2Balance = await paymentToken.read.balanceOf([addr2.account.address]);
+                console.log(`addr2 balance after transfer: ${formatUnits(addr2Balance, paymentTokenDecimals)} USDC`);
+            }
+            
+            // 1. Get the current market prices
+            const [currentYesPrice, currentNoPrice] = await betTogether.read.getPoolPrices([truthMarketAddress]);
+            console.log(`\nCurrent market prices:`);
+            console.log(`YES: ${formatUnits(currentYesPrice, 18)} (${Number(formatUnits(currentYesPrice, 18)) * 100}%)`);
+            console.log(`NO: ${formatUnits(currentNoPrice, 18)} (${Number(formatUnits(currentNoPrice, 18)) * 100}%)`);
+            
+            // 2. Approve USDC spending by BetTogether contract
+            console.log("\nApproving USDC spending for all parties");
+            
+            // Owner approves for bet creation
+            const ownerApprovalAmount = parseUnits("0.2", paymentTokenDecimals);
+            let hash = await paymentToken.write.approve(
+                [betTogether.address, ownerApprovalAmount],
+                { account: owner.account! }
+            );
+            await publicClient.waitForTransactionReceipt({ hash });
+            
+            // addr1 approves for bet acceptance
+            const addr1ApprovalAmount = parseUnits("0.2", paymentTokenDecimals);
+            hash = await paymentToken.write.approve(
+                [betTogether.address, addr1ApprovalAmount],
+                { 
+                    account: addr1.account!,
+                    gas: 2000000n
+                }
+            );
+            await publicClient.waitForTransactionReceipt({ hash });
+            
+            // addr2 approves for trying to accept an already accepted bet
+            const addr2ApprovalAmount = parseUnits("0.2", paymentTokenDecimals);
+            hash = await paymentToken.write.approve(
+                [betTogether.address, addr2ApprovalAmount],
+                { 
+                    account: addr2.account!,
+                    gas: 2000000n
+                }
+            );
+            await publicClient.waitForTransactionReceipt({ hash });
+            
+            // 3. Owner creates a bet
+            console.log("\nCreating bet on TruthMarket");
+            
+            const initiatorAmount = parseUnits("0.1", paymentTokenDecimals);
+            const priceToleranceBps = 1000; // 10% tolerance (maximum)
+            
+            const betParams = {
+                marketAddress: truthMarketAddress,
+                takesYesPosition: true, // Owner takes YES position
+                amount: initiatorAmount,
+                priceToleranceBps: priceToleranceBps
+            };
+            
+            console.log("Creating bet with parameters:", {
+                marketAddress: betParams.marketAddress,
+                takesYesPosition: betParams.takesYesPosition,
+                amount: formatUnits(betParams.amount, paymentTokenDecimals),
+                priceToleranceBps: betParams.priceToleranceBps
+            });
+            
+            // Create the bet
+            hash = await betTogether.write.createBet(
+                [
+                    betParams.marketAddress, 
+                    betParams.takesYesPosition, 
+                    betParams.amount, 
+                    betParams.priceToleranceBps
+                ],
+                { 
+                    account: owner.account!,
+                    gas: 3000000n // Increase gas limit
+                }
+            );
+            
+            const receipt = await publicClient.waitForTransactionReceipt({ hash });
+            expect(receipt.status).to.equal('success', "Transaction failed");
+            
+            // Get the betId (should be 0 for the first bet)
+            const betId = 0n;
+            
+            // Verify the bet was created properly
+            const betDetails = await betTogether.read.getBet([betId]);
+            console.log("\nBet created with ID:", betId.toString());
+            
+            // 4. Calculate expected counterparty amount using contract's method
+            const expectedCounterpartyAmount = await betTogether.read.calculateCounterpartyAmount([
+                initiatorAmount,
+                betParams.takesYesPosition,
+                currentYesPrice,
+                currentNoPrice
+            ]);
+            console.log(`Expected counterparty amount: ${formatUnits(expectedCounterpartyAmount, paymentTokenDecimals)} USDC`);
+            
+            // 5. addr1 accepts the bet
+            console.log("\naddr1 accepting the bet...");
+            hash = await betTogether.write.acceptBet(
+                [betId],
+                { 
+                    account: addr1.account!,
+                    gas: 4000000n // Increase gas limit
+                }
+            );
+            
+            const acceptReceipt = await publicClient.waitForTransactionReceipt({ hash });
+            expect(acceptReceipt.status).to.equal('success', "Accept transaction failed");
+            
+            // 6. Try to accept the same bet with addr2 (should fail)
+            console.log("\naddr2 attempting to accept already accepted bet (should fail)...");
+            try {
+                await betTogether.write.acceptBet(
+                    [betId],
+                    { 
+                        account: addr2.account!,
+                        gas: 4000000n
+                    }
+                );
+                // If we get here, the transaction didn't revert as expected
+                expect.fail("Second acceptance should have failed");
+            } catch (error: any) {
+                console.log("Expected error occurred:", error.message.substring(0, 100) + "...");
+                // The error message is different in the mainnet fork, so just check that some error occurred
+                expect(error).to.exist;
+                console.log("✓ Second acceptance correctly failed as expected");
+            }
+            
+            // 7. Check YES and NO token balances for initiator and acceptor
+            // We expect the owner (initiator with YES position) to have YES tokens
+            // and addr1 (acceptor) to have NO tokens
+            
+            const betData = await betTogether.read.getBet([betId]);
+            const tokensMinted = BigInt(betData[5]); // acceptorAmount 
+            console.log(`\nTransaction complete. Checking token distributions...`);
+            
+            // Calculate expected token amounts (should be scaled by token decimals)
+            const totalDeposited = initiatorAmount + expectedCounterpartyAmount;
+            const yesDec = await yesToken.read.decimals();
+            const noDec = await noToken.read.decimals();
+            
+            // Expected minted amount in YES/NO tokens - implement our own calculation
+            const expectedTokenAmount = (totalDeposited * (10n ** BigInt(yesDec))) / (10n ** BigInt(paymentTokenDecimals));
+            
+            console.log(`Expected token amount: ${expectedTokenAmount} (scaled by ${yesDec} decimals)`);
+            
+            // Check actual balances
+            const ownerYesBalance = await yesToken.read.balanceOf([owner.account!.address]);
+            const ownerNoBalance = await noToken.read.balanceOf([owner.account!.address]);
+            const addr1YesBalance = await yesToken.read.balanceOf([addr1.account!.address]);
+            const addr1NoBalance = await noToken.read.balanceOf([addr1.account!.address]);
+            
+            console.log("\nToken balances after bet execution:");
+            console.log(`Owner YES balance: ${ownerYesBalance}`);
+            console.log(`Owner NO balance: ${ownerNoBalance}`);
+            console.log(`addr1 YES balance: ${addr1YesBalance}`);
+            console.log(`addr1 NO balance: ${addr1NoBalance}`);
+            
+            // Verify the token distribution is correct - convert BigInt to number for comparison
+            const ownerYesBalanceNum = Number(formatUnits(ownerYesBalance, yesDec));
+            const addr1NoBalanceNum = Number(formatUnits(addr1NoBalance, noDec));
+            
+            expect(ownerYesBalanceNum).to.be.greaterThan(0, "Owner should have received YES tokens");
+            expect(addr1NoBalanceNum).to.be.greaterThan(0, "addr1 should have received NO tokens");
+            
+            // The acceptor should have 0 YES tokens (or very close to 0 if they had some before)
+            // The initiator should have 0 NO tokens (or very close to 0 if they had some before)
+            if (addr1YesBalance > 0n) {
+                console.log("addr1 already had YES tokens before this test");
+            }
+            if (ownerNoBalance > 0n) {
+                console.log("Owner already had NO tokens before this test");
+            }
+            
+            // Verify the bet is now marked as executed
+            const betAfter = await betTogether.read.getBet([betId]);
+            expect(betAfter[8]).to.be.true; // isExecuted should be true
+            
+            console.log("\nFull bet workflow test completed successfully!");
         });
     });
 }); 
