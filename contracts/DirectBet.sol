@@ -9,6 +9,10 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 import "src/interfaces/ITruthMarket.sol";
 import "src/MarketEnums.sol";
+import {OracleLibrary} from "@uniswap/v3-periphery/contracts/libraries/OracleLibrary.sol";
+import {FullMath}      from "@uniswap/v3-core/contracts/libraries/FullMath.sol";
+
+import "hardhat/console.sol";
 
 /**
  * @title BetTogether
@@ -39,7 +43,9 @@ contract BetTogether is ReentrancyGuard, Ownable {
     uint256 public constant PRICE_PRECISION = 1e18; 
     // System tolerance for pool consistency check (e.g., 0.5% = 50 BPS)
     // 1 BPS = 0.01%, so 50 BPS = 0.5%
-    uint256 public POOL_CONSISTENCY_TOLERANCE_BPS = 50; 
+    uint256 public POOL_CONSISTENCY_TOLERANCE_BPS = 50;
+    // Time window for TWAP calculation (30 minutes)
+    uint32 public constant TWAP_SECONDS = 1_800;
 
     // Storage
     mapping(uint256 => Bet) public bets;
@@ -104,6 +110,13 @@ contract BetTogether is ReentrancyGuard, Ownable {
         require(priceToleranceBps > 0 && priceToleranceBps <= 10000, "Invalid price tolerance BPS"); // Max 100%
         
         ITruthMarket market = ITruthMarket(marketAddress);
+        
+        // Check if marketAddress is a valid TruthMarket contract
+        try market.paymentToken() returns (address tokenAddress) {
+            require(tokenAddress != address(0), "Payment token cannot be zero address");
+        } catch {
+            revert("Invalid TruthMarket contract address");
+        }
         
         require(uint8(market.getCurrentStatus()) != uint8(MarketStatus.Finalized), "Market already finalized");
         
@@ -210,76 +223,49 @@ contract BetTogether is ReentrancyGuard, Ownable {
      */
     function _getAverageFairPrices(address marketAddress) internal view returns (uint256 avgYesPrice, uint256 avgNoPrice) {
         ITruthMarket market = ITruthMarket(marketAddress);
-        (address yesPoolAddress, address noPoolAddress) = market.getPoolAddresses();
+        (address yesPool, address noPool) = market.getPoolAddresses();
+        require(yesPool != address(0) && noPool != address(0), "Pools not set");
 
-        require(yesPoolAddress != address(0) && noPoolAddress != address(0), "Pool addresses not set");
+        // 1. Pull 30-minute TWAP ticks from each pool
+        (int24 yesTick,) = OracleLibrary.consult(yesPool, TWAP_SECONDS);
+        (int24 noTick,) = OracleLibrary.consult(noPool, TWAP_SECONDS);
 
-        uint256 directYesPrice = 0;
-        uint256 directNoPrice = 0;
+        // 2. Convert tick → price (1e18-scaled)
+        // We always ask: "how many payment tokens for 1 YES/NO token?"
+        uint256 oneToken = PRICE_PRECISION;  // pretend every token has 18 decimals
+        address payTok = market.paymentToken();
 
-        // Get direct YES price
-        try this.getSqrtPriceX96(yesPoolAddress) returns (uint160 sqrtPriceX96) {
-            if (sqrtPriceX96 == 0) {
-                revert("Zero sqrtPrice from YES pool");
-            }
-            
-            uint256 priceFromPool = (uint256(sqrtPriceX96) * uint256(sqrtPriceX96) * PRICE_PRECISION) >> (96 * 2);
-            
-            if (IUniswapV3Pool(yesPoolAddress).token0() == market.yesToken()) { // Assuming paymentToken is token1
-                directYesPrice = priceFromPool;
-            } else { // yesToken is token1, paymentToken is token0. Price needs inversion for yesToken/paymentToken.
-                directYesPrice = priceFromPool > 0 ? (PRICE_PRECISION * PRICE_PRECISION) / priceFromPool : 0;
-            }
-            
-            if (directYesPrice == 0 || directYesPrice > PRICE_PRECISION) {
-                revert("Invalid YES price from pool");
-            }
-        } catch {
-            revert("Failed to get YES price from pool");
-        }
-
-        // Get direct NO price
-        try this.getSqrtPriceX96(noPoolAddress) returns (uint160 sqrtPriceX96_no) {
-            if (sqrtPriceX96_no == 0) {
-                revert("Zero sqrtPrice from NO pool");
-            }
-            
-            uint256 priceFromPoolNo = (uint256(sqrtPriceX96_no) * uint256(sqrtPriceX96_no) * PRICE_PRECISION) >> (96 * 2);
-            
-            if (IUniswapV3Pool(noPoolAddress).token0() == market.noToken()) { // Assuming paymentToken is token1
-                directNoPrice = priceFromPoolNo;
-            } else { // noToken is token1, paymentToken is token0. Price needs inversion.
-                directNoPrice = priceFromPoolNo > 0 ? (PRICE_PRECISION * PRICE_PRECISION) / priceFromPoolNo : 0;
-            }
-            
-            if (directNoPrice == 0 || directNoPrice > PRICE_PRECISION) {
-                revert("Invalid NO price from pool");
-            }
-        } catch {
-            revert("Failed to get NO price from pool");
-        }
-
-        // Consistency Check: directYesPrice + directNoPrice approx PRICE_PRECISION
-        uint256 sumPrice = directYesPrice + directNoPrice;
-        uint256 deviation;
-        if (sumPrice > PRICE_PRECISION) {
-            deviation = sumPrice - PRICE_PRECISION;
+        // YES price
+        if (IUniswapV3Pool(yesPool).token0() == payTok) {
+            // pool is payment/YES ⇒ getQuote gives YES per 1 payment; invert
+            uint256 quote = OracleLibrary.getQuoteAtTick(yesTick, uint128(oneToken), payTok, market.yesToken());
+            avgYesPrice = FullMath.mulDiv(oneToken, oneToken, quote);  // 1 / quote
         } else {
-            deviation = PRICE_PRECISION - sumPrice;
+            // pool is YES/payment ⇒ getQuote gives payment per 1 YES (already what we want)
+            avgYesPrice = OracleLibrary.getQuoteAtTick(yesTick, uint128(oneToken), market.yesToken(), payTok);
         }
-        uint256 allowedPoolDeviation = (PRICE_PRECISION * POOL_CONSISTENCY_TOLERANCE_BPS) / 10000;
-        require(deviation <= allowedPoolDeviation, "Pool prices inconsistent");
 
-        // Averaging logic:
-        // 1. Direct YES price: directYesPrice
-        // 2. Implied YES price from NO pool: PRICE_PRECISION - directNoPrice
-        uint256 impliedYesPriceFromNo = PRICE_PRECISION - directNoPrice;
-        avgYesPrice = (directYesPrice + impliedYesPriceFromNo) / 2;
-        avgNoPrice = PRICE_PRECISION - avgYesPrice; // Ensure they sum up
+        // NO price
+        if (IUniswapV3Pool(noPool).token0() == payTok) {
+            uint256 quote = OracleLibrary.getQuoteAtTick(noTick, uint128(oneToken), payTok, market.noToken());
+            avgNoPrice = FullMath.mulDiv(oneToken, oneToken, quote);
+        } else {
+            avgNoPrice = OracleLibrary.getQuoteAtTick(noTick, uint128(oneToken), market.noToken(), payTok);
+        }
 
-        // Final sanity check on calculated average prices
-        require(avgYesPrice > 0 && avgYesPrice < PRICE_PRECISION, "Avg YES price out of bounds"); // Usually not exactly 0 or 1
-        require(avgNoPrice > 0 && avgNoPrice < PRICE_PRECISION, "Avg NO price out of bounds");   // Usually not exactly 0 or 1
+        // 3. Consistency guard + optional normalization
+        require(avgYesPrice > 0 && avgYesPrice < PRICE_PRECISION, "YES price out of range");
+        require(avgNoPrice > 0 && avgNoPrice < PRICE_PRECISION, "NO price out of range");
+
+        uint256 sum = avgYesPrice + avgNoPrice;
+        uint256 dev = sum > PRICE_PRECISION ? sum - PRICE_PRECISION : PRICE_PRECISION - sum;
+        uint256 maxDev = FullMath.mulDiv(PRICE_PRECISION, POOL_CONSISTENCY_TOLERANCE_BPS, 10_000);
+
+        if (dev > maxDev) {
+            // Normalize so they add to exactly 1.0
+            avgYesPrice = FullMath.mulDiv(avgYesPrice, PRICE_PRECISION, sum);
+            avgNoPrice = PRICE_PRECISION - avgYesPrice;
+        }
     }
     
     /**
@@ -324,11 +310,11 @@ contract BetTogether is ReentrancyGuard, Ownable {
             // First party has YES (amount_yes), counterparty needs NO.
             // The value of tokens should be equal: amount_yes * yesTokenPrice = amount_no * noTokenPrice
             // So, amount_no = (firstPartyAmount * yesTokenPrice) / noTokenPrice.
-            return (firstPartyAmount * yesTokenPrice) / noTokenPrice;
+            return FullMath.mulDiv(firstPartyAmount, yesTokenPrice, noTokenPrice);
         } else {
             // First party has NO (amount_no), counterparty needs YES.
             // amount_yes = (firstPartyAmount * noTokenPrice) / yesTokenPrice.
-            return (firstPartyAmount * noTokenPrice) / yesTokenPrice;
+            return FullMath.mulDiv(firstPartyAmount, noTokenPrice, yesTokenPrice);
         }
     }
     
@@ -403,7 +389,11 @@ contract BetTogether is ReentrancyGuard, Ownable {
         // paymentTokenAmount * (10 ** yesNoTokenDecimals) / (10 ** paymentTokenDecimals)
         market.mint(totalPaymentAmount); 
         
-        uint256 totalTokensMintedPerType = totalPaymentAmount * (10**yesNoTokenDecimals) / (10**paymentTokenDecimals);
+        uint256 totalTokensMintedPerType = FullMath.mulDiv(
+            totalPaymentAmount,
+            10**yesNoTokenDecimals,
+            10**paymentTokenDecimals
+        );
         require(totalTokensMintedPerType > 0, "Minted zero tokens");
 
         if (bet.initiatorTakesYesPosition) {
