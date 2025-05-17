@@ -13,8 +13,6 @@ import "src/MarketEnums.sol";
 import {OracleLibrary} from "@uniswap/v3-periphery/contracts/libraries/OracleLibrary.sol";
 import {FullMath}      from "@uniswap/v3-core/contracts/libraries/FullMath.sol";
 
-import "hardhat/console.sol";
-
 /**
  * @title BetTogether
  * @dev Enables two users to collaboratively mint YES/NO prediction market tokens
@@ -44,8 +42,8 @@ contract BetTogether is ReentrancyGuard, Ownable {
     // PRICE_PRECISION represents 1.0 or 100% for price calculations
     uint256 public constant PRICE_PRECISION = 1e18; 
     // System tolerance for pool consistency check (e.g., 0.5% = 50 BPS)
-    // 1 BPS = 0.01%, so 50 BPS = 0.5%
-    uint16 public POOL_CONSISTENCY_TOLERANCE_BPS = 50;
+    // 1 BPS = 0.01%, so 150 BPS = 1.5%
+    uint16 public POOL_CONSISTENCY_TOLERANCE_BPS = 150;
     // Time window for TWAP calculation (30 minutes)
     uint32 public constant TWAP_SECONDS = 1_800;
     // One yes/no token in its smallest unit (1 with 18 zeroes)
@@ -385,14 +383,15 @@ contract BetTogether is ReentrancyGuard, Ownable {
         require(noTokenPrice > 0 && noTokenPrice < PRICE_PRECISION, "Invalid NO price for calc");
         
         if (firstPartyIsYes) {
-            // First party has YES (amount_yes), counterparty needs NO.
-            // The value of tokens should be equal: amount_yes * yesTokenPrice = amount_no * noTokenPrice
-            // So, amount_no = (firstPartyAmount * yesTokenPrice) / noTokenPrice.
-            return FullMath.mulDiv(firstPartyAmount, yesTokenPrice, noTokenPrice);
-        } else {
-            // First party has NO (amount_no), counterparty needs YES.
-            // amount_yes = (firstPartyAmount * noTokenPrice) / yesTokenPrice.
+            // First party has YES, counterparty needs NO.
+            // Each user receives token value equal to their deposit:
+            // For equal number of tokens, the ratio of deposits should equal the ratio of prices:
+            // amount_no = amount_yes * (noTokenPrice / yesTokenPrice)
             return FullMath.mulDiv(firstPartyAmount, noTokenPrice, yesTokenPrice);
+        } else {
+            // First party has NO, counterparty needs YES.
+            // amount_yes = amount_no * (yesTokenPrice / noTokenPrice)
+            return FullMath.mulDiv(firstPartyAmount, yesTokenPrice, noTokenPrice);
         }
     }
     

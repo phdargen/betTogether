@@ -94,6 +94,6 @@ npx hardhat verify --network base DEPLOYED_CONTRACT_ADDRESS 0x61A98Bef11867c6948
 ## Deployed contract
 
 ```shell
-0xca6a590501e675fe223aa5704956c77e890aab31
-https://basescan.org/address/0xca6a590501e675fe223aa5704956c77e890aab31#code
+0xfddcddc9f9ab2a14cbbcfc7762eb89f5d5de4dea
+https://basescan.org/address/0xfddcddc9f9ab2a14cbbcfc7762eb89f5d5de4dea#code
 ```
